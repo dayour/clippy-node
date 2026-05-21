@@ -36,6 +36,7 @@ public sealed record ChatExplorationPreset
     public double Gutter { get; init; } = 64;
     public double MessageGap { get; init; } = 12;
     public string PaddingDensity { get; init; } = "Cozy";
+    public string UserBubbleTone { get; init; } = "Secondary";
     public bool   ShowTimestamps { get; init; } = true;
     public bool   ShowAssistantBubbles { get; init; } = true;
     public bool   ShowToolCalls { get; init; } = true;
@@ -164,6 +165,7 @@ public static class ChatExplorationPresetStore
         Gutter = ChatExplorationState.Gutter,
         MessageGap = ChatExplorationState.MessageGap,
         PaddingDensity = ChatExplorationState.PaddingDensity.ToString(),
+        UserBubbleTone = ChatExplorationState.UserBubbleTone.ToString(),
         ShowTimestamps = ChatExplorationState.ShowTimestamps,
         ShowAssistantBubbles = ChatExplorationState.ShowAssistantBubbles,
         ShowToolCalls = ChatExplorationState.ShowToolCalls,
@@ -211,6 +213,7 @@ public static class ChatExplorationPresetStore
         ChatExplorationState.Gutter = p.Gutter;
         ChatExplorationState.MessageGap = p.MessageGap;
         if (Enum.TryParse<ChatPaddingDensity>(p.PaddingDensity, out var pd)) ChatExplorationState.PaddingDensity = pd;
+        if (Enum.TryParse<ChatUserBubbleTone>(p.UserBubbleTone, out var ut)) ChatExplorationState.UserBubbleTone = ut;
         ChatExplorationState.ShowTimestamps = p.ShowTimestamps;
         ChatExplorationState.ShowAssistantBubbles = p.ShowAssistantBubbles;
         ChatExplorationState.ShowToolCalls = p.ShowToolCalls;

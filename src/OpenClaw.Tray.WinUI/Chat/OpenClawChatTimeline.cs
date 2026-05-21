@@ -462,8 +462,17 @@ public class OpenClawChatTimeline : Component<OpenClawChatTimelineProps>
             : (Brush)new SolidColorBrush(Microsoft.UI.Colors.Transparent);
         var assistantBubbleBg   = ChatVisualResolver.AssistantBubbleBrush(themeBrush("SubtleFillColorSecondaryBrush"));
         var assistantBubbleBdr  = themeBrush("ControlStrokeColorDefaultBrush");
-        var userBubbleBg        = ChatVisualResolver.UserBubbleBrush(themeBrush("AccentFillColorDefaultBrush"));
-        var userBubbleBdr       = themeBrush("AccentFillColorDefaultBrush");
+        // User bubble brushes vary with the configured tone. Accent → bold
+        // brand-color bubble with white text (classic iMessage feel).
+        // Secondary → ``AccentFillColorSecondaryBrush`` — the same accent
+        // color at a softer fill weight. Both modes pair with
+        // ``TextOnAccentFillColorPrimaryBrush``, which Fluent guarantees
+        // meets WCAG AA contrast against any accent-tinted fill in both
+        // light and dark themes (Microsoft's Fluent design token spec).
+        var userToneIsAccent    = ChatExplorationState.UserBubbleTone == ChatUserBubbleTone.Accent;
+        var userBubbleBg        = ChatVisualResolver.UserBubbleBrush(
+            themeBrush(userToneIsAccent ? "AccentFillColorDefaultBrush" : "AccentFillColorSecondaryBrush"));
+        var userBubbleBdr       = themeBrush(userToneIsAccent ? "AccentFillColorDefaultBrush" : "AccentFillColorSecondaryBrush");
         var userBubbleFg        = themeBrush("TextOnAccentFillColorPrimaryBrush");
         var avatarPanelBg       = themeBrush("SubtleFillColorTertiaryBrush");
         var avatarBorder        = themeBrush("ControlStrokeColorDefaultBrush");

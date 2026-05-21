@@ -117,7 +117,10 @@ public class ChatExplorationsPanel : Component
                 v => ChatExplorationState.BubbleSideMargin = v),
             EnumCombo("Padding density", ChatExplorationState.PaddingDensity,
                 v => ChatExplorationState.PaddingDensity = v,
-                ChatPaddingDensity.Cozy, ChatPaddingDensity.Comfortable, ChatPaddingDensity.Compact)
+                ChatPaddingDensity.Cozy, ChatPaddingDensity.Comfortable, ChatPaddingDensity.Compact),
+            EnumCombo("User bubble tone", ChatExplorationState.UserBubbleTone,
+                v => ChatExplorationState.UserBubbleTone = v,
+                ChatUserBubbleTone.Secondary, ChatUserBubbleTone.Accent)
         );
 
         // ── C.1. Bubble visibility & footer ──────────────────────────

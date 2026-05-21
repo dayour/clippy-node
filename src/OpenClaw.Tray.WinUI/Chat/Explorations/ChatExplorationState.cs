@@ -32,6 +32,22 @@ public enum ChatPaddingDensity
     Compact,
 }
 
+/// <summary>
+/// Tone used for the user (sent) chat bubble. <c>Accent</c> paints the
+/// bubble with the system accent color at full weight (<c>AccentFillColorDefault</c>) —
+/// classic iMessage-style bold brand-color bubble. <c>Secondary</c> uses the
+/// softer accent variant (<c>AccentFillColorSecondary</c>) — still clearly
+/// the accent color, but a step down in saturation so it doesn't compete
+/// with the accent-colored avatar / send button. Both tones pair with
+/// <c>TextOnAccentFillColorPrimaryBrush</c>, which Fluent guarantees meets
+/// WCAG AA contrast in light, dark, and High Contrast themes.
+/// </summary>
+public enum ChatUserBubbleTone
+{
+    Accent,
+    Secondary,
+}
+
 public enum ChatPreviewTheme
 {
     System,
@@ -150,6 +166,7 @@ public static class ChatExplorationState
     private static double _gutter = 64d;
     private static double _messageGap = 12d;
     private static ChatPaddingDensity _paddingDensity = ChatPaddingDensity.Cozy;
+    private static ChatUserBubbleTone _userBubbleTone = ChatUserBubbleTone.Secondary;
     private static bool _showTimestamps = true;
 
     private static bool _showAvatars = true;
@@ -256,6 +273,12 @@ public static class ChatExplorationState
     {
         get => _paddingDensity;
         set { if (_paddingDensity != value) { _paddingDensity = value; RaiseChanged(); } }
+    }
+
+    public static ChatUserBubbleTone UserBubbleTone
+    {
+        get => _userBubbleTone;
+        set { if (_userBubbleTone != value) { _userBubbleTone = value; RaiseChanged(); } }
     }
 
     public static bool ShowTimestamps
