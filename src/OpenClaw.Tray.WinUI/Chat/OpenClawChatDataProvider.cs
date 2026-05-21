@@ -62,6 +62,10 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     private readonly IChatGatewayBridge _bridge;
     private readonly Action<Action>? _post;
     private readonly object _gate = new();
+    private readonly object _toolMetaSaveGate = new();
+    private readonly string _toolMetaCacheFilePath;
+    private System.Threading.Timer? _toolMetaSaveTimer; // debounce cache writes
+    private long _toolMetaSaveVersion;
     private readonly Dictionary<string, ChatTimelineState> _timelines = new();
     private readonly Dictionary<string, string> _activeRunIds = new();   // sessionKey → runId
     private readonly Dictionary<string, int> _pendingAbortCounts = new(); // threads → count of pending aborts waiting for lifecycle.start
@@ -76,6 +80,10 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     private readonly Dictionary<string, string> _sessionIds = new();      // sessionKey → immutable sessionId
     private readonly HashSet<string> _historyLoaded = new();              // sessionKey
     private readonly HashSet<string> _historyInFlight = new();            // sessionKey
+    // Per-session cache of tool metadata from live SSE events.
+    // Keyed by gateway sessionId (immutable UUID).  Persisted to disk
+    // so that history reconstruction on restart can recover tool names.
+    private Dictionary<string, List<CachedToolMeta>> _toolMetaCache;
     // Track recently-sent local user message texts so we can suppress
     // SSE echoes while still displaying messages from other clients.
     private readonly Dictionary<string, Queue<LocalSentText>> _localSentTexts = new();
@@ -114,11 +122,20 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     /// the source event on (acceptable in unit tests).
     /// </param>
     public OpenClawChatDataProvider(IChatGatewayBridge bridge, Action<Action>? post = null)
+        : this(bridge, post, DefaultToolMetaCacheFilePath)
+    {
+    }
+
+    internal OpenClawChatDataProvider(IChatGatewayBridge bridge, Action<Action>? post, string toolMetaCacheFilePath)
     {
         _bridge = bridge ?? throw new ArgumentNullException(nameof(bridge));
         _post = post;
+        _toolMetaCacheFilePath = !string.IsNullOrWhiteSpace(toolMetaCacheFilePath)
+            ? toolMetaCacheFilePath
+            : throw new ArgumentException("Tool metadata cache path is required.", nameof(toolMetaCacheFilePath));
         _status = bridge.CurrentStatus;
         _persistedAbortedIds = LoadAbortedIds();
+        _toolMetaCache = LoadToolMetaCache(_toolMetaCacheFilePath);
 
         // Seed models from whatever the bridge already knows about (a connect
         // that completed before the provider was constructed will have its
@@ -374,6 +391,12 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
 
                 Logger.Info($"[ChatHistory] Loading thread '{threadId}' — {ordered.Count} messages from gateway");
 
+                // Load cached tool metadata for this session to restore tool names
+                // that the gateway strips from history responses.
+                var cachedTools = GetCachedToolMetaForSession(history.SessionId);
+                if (cachedTools is not null)
+                    Logger.Info($"[ChatHistory] Found {cachedTools.Count} cached tool metadata entries for session");
+
                 bool nextAssistantIsAborted = false;
 
                 foreach (var msg in ordered)
@@ -470,11 +493,13 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
                             }
                             if (LooksLikeFlattenedToolOutput(text))
                             {
-                                var kind = ClassifyFlattenedToolOutput(text);
-                                Logger.Debug($"[ChatHistory]   → routed: TOOL chip kind='{kind}'");
+                                var cached = TryMatchCachedTool(cachedTools, msg.Ts);
+                                var kind = cached?.ToolName ?? ClassifyFlattenedToolOutput(text);
+                                var label = cached?.Label ?? ExtractFlattenedToolSummary(text);
+                                Logger.Debug($"[ChatHistory]   → routed: TOOL chip kind='{kind}' cached={cached is not null}");
                                 rebuilt = ApplyAndCaptureMeta(
                                     rebuilt,
-                                    new ChatToolStartEvent(kind, kind),
+                                    new ChatToolStartEvent(label, kind),
                                     msgMeta);
                                 rebuilt = ApplyAndCaptureMeta(
                                     rebuilt,
@@ -499,11 +524,13 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
                             // the heuristic fires, since the role itself confirms
                             // it's tool output.
                             {
-                                var kind = ClassifyFlattenedToolOutput(text);
-                                Logger.Debug($"[ChatHistory]   → routed: TOOL chip (role=toolresult, kind='{kind}')");
+                                var cached = TryMatchCachedTool(cachedTools, msg.Ts);
+                                var kind = cached?.ToolName ?? ClassifyFlattenedToolOutput(text);
+                                var label = cached?.Label ?? ExtractFlattenedToolSummary(text);
+                                Logger.Debug($"[ChatHistory]   → routed: TOOL chip (role=toolresult, kind='{kind}' cached={cached is not null})");
                                 rebuilt = ApplyAndCaptureMeta(
                                     rebuilt,
-                                    new ChatToolStartEvent(kind, kind),
+                                    new ChatToolStartEvent(label, kind),
                                     msgMeta);
                                 rebuilt = ApplyAndCaptureMeta(
                                     rebuilt,
@@ -747,6 +774,15 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     {
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
+        System.Threading.Timer? timerToDispose;
+        lock (_gate)
+        {
+            timerToDispose = _toolMetaSaveTimer;
+            _toolMetaSaveTimer = null;
+            _toolMetaSaveVersion++;
+        }
+        timerToDispose?.Dispose();
+        SaveToolMetaCache();
         _bridge.StatusChanged -= OnStatusChanged;
         _bridge.SessionsUpdated -= OnSessionsUpdated;
         _bridge.ChatMessageReceived -= OnChatMessageReceived;
@@ -1003,7 +1039,8 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             lock (_gate) { trMeta = BuildLiveMetaLocked(trThread, message.Ts); }
             var capped = TruncateForChatEntry(message.Text);
             var kind = ClassifyFlattenedToolOutput(capped);
-            ApplyEventAndPublish(trThread, new ChatToolStartEvent(kind, kind), trMeta);
+            var label = ExtractFlattenedToolSummary(capped);
+            ApplyEventAndPublish(trThread, new ChatToolStartEvent(label, kind), trMeta);
             ApplyEventAndPublish(trThread, new ChatToolOutputEvent(capped), trMeta);
             return;
         }
@@ -1105,6 +1142,13 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
 
         ChatEvent? mapped = MapAgentEvent(evt);
         if (mapped is null) return;
+
+        // Cache tool metadata from live SSE events so it survives app restarts.
+        if (mapped is ChatToolStartEvent toolStart && !string.IsNullOrEmpty(toolStart.ToolName))
+        {
+            var tsMs0 = evt.Ts > 0 ? (long)evt.Ts : 0L;
+            CacheToolMeta(threadId, tsMs0, toolStart.ToolName, toolStart.Text);
+        }
 
         // AgentEventInfo.Ts is a double of unix-epoch ms (per OpenClawGatewayClient).
         var tsMs = evt.Ts > 0 ? (long)evt.Ts : 0L;
@@ -1821,17 +1865,73 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     /// <summary>
     /// Best-guess kind label for a flattened-tool-output assistant
     /// message. Used to populate the tool chip's monospace kind suffix.
+    /// Detects tool types from common output patterns as a heuristic
+    /// fallback when cached metadata is unavailable.
     /// </summary>
     internal static string ClassifyFlattenedToolOutput(string text)
     {
+        if (string.IsNullOrEmpty(text)) return "exec";
+
+        // Shell/process markers
         if (text.Contains("Command still running", StringComparison.Ordinal) ||
             text.Contains("Process exited with code", StringComparison.Ordinal))
-            return "process";
+            return "bash";
+
+        // File read patterns (numbered lines like "1. ", "42. ")
+        if (s_numberedLineRegex.IsMatch(text))
+            return "view";
+
+        // Grep / search result patterns ("path/file.ext:123:matched line")
+        if (s_grepResultRegex.IsMatch(text))
+            return "grep";
+
+        // Directory listing / glob patterns
+        if (text.Contains("Directory:", StringComparison.Ordinal) ||
+            text.Contains("Mode                ", StringComparison.Ordinal))
+            return "glob";
+
+        // Git output
+        if (text.StartsWith("commit ", StringComparison.Ordinal) ||
+            text.StartsWith("diff --git", StringComparison.Ordinal) ||
+            text.Contains("Author:", StringComparison.Ordinal) && text.Contains("Date:", StringComparison.Ordinal))
+            return "git";
+
+        // Edit/write patterns
+        if (text.Contains("successfully created", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("File written", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Applied edit", StringComparison.OrdinalIgnoreCase))
+            return "edit";
+
+        // Exec completed marker
         if (text.Contains("Exec completed (", StringComparison.Ordinal))
             return "exec";
-        // Anything matching the CLI-help heuristics is also a shell exec
-        // result — give it the same chip kind as live exec calls.
+
         return "exec";
+    }
+
+    /// <summary>Matches numbered output lines typical of file view output (e.g. "  1. content").</summary>
+    private static readonly System.Text.RegularExpressions.Regex s_numberedLineRegex =
+        new(@"^\s*\d+\.\s", System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.Multiline);
+
+    /// <summary>Matches grep-style results (path:line:content).</summary>
+    private static readonly System.Text.RegularExpressions.Regex s_grepResultRegex =
+        new(@"^[^\s:]+\.\w+:\d+:", System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.Multiline);
+
+    /// <summary>
+    /// Extract a short one-line summary from flattened tool output text
+    /// for use as the tool chip label. Truncates to 80 chars.
+    /// </summary>
+    internal static string ExtractFlattenedToolSummary(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        // Use the first non-empty line as the summary
+        var firstLine = text.AsSpan().TrimStart();
+        var lineEnd = firstLine.IndexOfAny('\r', '\n');
+        if (lineEnd > 0) firstLine = firstLine[..lineEnd];
+        var summary = firstLine.Length > 80
+            ? new string(firstLine[..77]) + "…"
+            : new string(firstLine);
+        return summary;
     }
 
     // ── State helpers ──
@@ -2182,6 +2282,202 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             File.WriteAllText(AbortedIdsFilePath, json);
         }
         catch { /* best-effort persistence */ }
+    }
+
+    // ── Tool metadata persistence ─────────────────────────────────────
+
+    /// <summary>Cached tool call metadata entry persisted to disk.</summary>
+    internal sealed class CachedToolMeta
+    {
+        public long Ts { get; set; }
+        public string ToolName { get; set; } = "";
+        public string Label { get; set; } = "";
+    }
+
+    private static string DefaultToolMetaCacheFilePath
+    {
+        get
+        {
+            var root = Environment.GetEnvironmentVariable("OPENCLAW_TRAY_DATA_DIR") is { Length: > 0 } overrideDir
+                ? overrideDir
+                : Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "OpenClawTray");
+            return Path.Combine(root, "tool-metadata.json");
+        }
+    }
+
+    /// <summary>Max sessions to keep in the tool metadata cache.</summary>
+    internal const int MaxCachedSessions = 20;
+
+    /// <summary>Max tool entries per session in the cache.</summary>
+    internal const int MaxToolEntriesPerSession = 500;
+
+    private static Dictionary<string, List<CachedToolMeta>> LoadToolMetaCache(string cacheFilePath)
+    {
+        try
+        {
+            if (!File.Exists(cacheFilePath))
+                return new();
+            var json = File.ReadAllText(cacheFilePath);
+            var dict = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, List<CachedToolMeta>>>(json);
+            return dict ?? new();
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    private void SaveToolMetaCache(long? expectedVersion = null)
+    {
+        try
+        {
+            Dictionary<string, List<CachedToolMeta>> snapshot;
+            lock (_gate)
+            {
+                if (expectedVersion is long version && (version != _toolMetaSaveVersion || _disposed))
+                    return;
+
+                snapshot = _toolMetaCache.ToDictionary(
+                    kv => kv.Key,
+                    kv => kv.Value.Select(e => new CachedToolMeta
+                    {
+                        Ts = e.Ts,
+                        ToolName = e.ToolName,
+                        Label = e.Label
+                    }).ToList(),
+                    StringComparer.Ordinal);
+            }
+
+            // Evict oldest sessions if over the cap
+            if (snapshot.Count > MaxCachedSessions)
+            {
+                var toRemove = snapshot
+                    .OrderBy(kv => kv.Value.Count > 0 ? kv.Value[^1].Ts : 0)
+                    .Take(snapshot.Count - MaxCachedSessions)
+                    .Select(kv => kv.Key)
+                    .ToList();
+                foreach (var k in toRemove) snapshot.Remove(k);
+            }
+
+            var json = System.Text.Json.JsonSerializer.Serialize(snapshot,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+
+            lock (_toolMetaSaveGate)
+            {
+                if (expectedVersion is long version)
+                {
+                    lock (_gate)
+                    {
+                        if (version != _toolMetaSaveVersion || _disposed)
+                            return;
+                    }
+                }
+
+                var dir = Path.GetDirectoryName(_toolMetaCacheFilePath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                // Write to a unique temp file then atomic move to avoid partial JSON on crash.
+                var tempPath = _toolMetaCacheFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllText(tempPath, json);
+                    File.Move(tempPath, _toolMetaCacheFilePath, overwrite: true);
+                }
+                finally
+                {
+                    try
+                    {
+                        if (File.Exists(tempPath))
+                            File.Delete(tempPath);
+                    }
+                    catch
+                    {
+                        // Best-effort cleanup; persistence remains best-effort.
+                    }
+                }
+            }
+        }
+        catch { /* best-effort persistence */ }
+    }
+
+    /// <summary>
+    /// Cache a tool call's metadata so it can be recovered when the gateway
+    /// flattens it during history replay on a future app launch.
+    /// </summary>
+    internal void CacheToolMeta(string threadId, long tsMs, string toolName, string label)
+    {
+        System.Threading.Timer? timerToDispose = null;
+        long saveVersion;
+        lock (_gate)
+        {
+            if (_disposed)
+                return;
+
+            if (!_sessionIds.TryGetValue(threadId, out var sessionId) || string.IsNullOrEmpty(sessionId))
+                return;
+
+            if (!_toolMetaCache.TryGetValue(sessionId, out var list))
+            {
+                list = new List<CachedToolMeta>();
+                _toolMetaCache[sessionId] = list;
+            }
+
+            // Deduplicate by timestamp (same tool event shouldn't be cached twice)
+            if (list.Count > 0 && list[^1].Ts == tsMs && list[^1].ToolName == toolName)
+                return;
+
+            list.Add(new CachedToolMeta { Ts = tsMs, ToolName = toolName, Label = label });
+
+            // Cap per-session entries
+            if (list.Count > MaxToolEntriesPerSession)
+                list.RemoveRange(0, list.Count - MaxToolEntriesPerSession);
+
+            // Debounce save — reset the timer on each cache addition so we only
+            // write once after 500ms of quiescence, avoiding concurrent file writes.
+            saveVersion = ++_toolMetaSaveVersion;
+            timerToDispose = _toolMetaSaveTimer;
+            _toolMetaSaveTimer = new System.Threading.Timer(_ => SaveToolMetaCache(saveVersion), null, 500, Timeout.Infinite);
+        }
+        timerToDispose?.Dispose();
+    }
+
+    /// <summary>
+    /// Look up cached tool metadata for a session's history reconstruction.
+    /// Returns a queue of entries sorted by timestamp for sequential consumption.
+    /// </summary>
+    private Queue<CachedToolMeta>? GetCachedToolMetaForSession(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return null;
+        lock (_gate)
+        {
+            if (_toolMetaCache.TryGetValue(sessionId!, out var list) && list.Count > 0)
+                return new Queue<CachedToolMeta>(list.OrderBy(e => e.Ts));
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Try to match a history tool entry to a cached metadata entry.
+    /// Both the cache and history are chronologically ordered, so we consume
+    /// entries sequentially. The cache stores tool-start timestamps while
+    /// history stores tool-result timestamps (which can be minutes later),
+    /// so we match by order rather than timestamp proximity.
+    /// </summary>
+    internal static CachedToolMeta? TryMatchCachedTool(Queue<CachedToolMeta>? cache, long historyTsMs)
+    {
+        if (cache is null || cache.Count == 0) return null;
+
+        // Both sequences are chronological. Consume the next cached entry
+        // for each tool result we encounter in history.
+        // Guard: if the history timestamp is much OLDER than the next cached
+        // entry, this toolresult predates our cache — skip it.
+        var candidate = cache.Peek();
+        if (historyTsMs > 0 && candidate.Ts > 0 && candidate.Ts > historyTsMs + 300_000)
+            return null; // cached entry is >5 min after this history entry — not a match
+
+        return cache.Dequeue();
     }
 
     /// <summary>
