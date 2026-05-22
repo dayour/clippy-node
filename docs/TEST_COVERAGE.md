@@ -1,6 +1,6 @@
 # Test Coverage Summary
 
-**Last audited**: 2026-05-21<br>
+**Last audited**: 2026-05-22<br>
 **Framework**: xUnit / .NET 10.0<br>
 **Required validation status**: passing (`.\build.ps1`, Shared tests, Tray tests)
 
@@ -11,10 +11,10 @@ These are the suites every agent must run after code changes, as documented in
 
 | Suite | Latest runtime result |
 |---|---:|
-| `OpenClaw.Shared.Tests` | 1,897 total: 1,869 passed, 28 skipped |
-| `OpenClaw.Tray.Tests` | 1,191 total: 1,191 passed, 0 skipped |
+| `OpenClaw.Shared.Tests` | 1,890 total: 1,862 passed, 28 skipped |
+| `OpenClaw.Tray.Tests` | 1,178 total: 1,178 passed, 0 skipped |
 
-Runtime totals come from `dotnet test` on 2026-05-21. They are higher than
+Runtime totals come from `dotnet test` on 2026-05-22. They are higher than
 method counts because some `[Theory]` tests expand into multiple cases.
 
 ## Test project inventory
@@ -22,8 +22,8 @@ method counts because some `[Theory]` tests expand into multiple cases.
 | Project | Primary scope | Test methods |
 |---|---|---:|
 | `OpenClaw.Connection.Tests` | Gateway registry, credential resolution, connection manager/state machine, setup codes, pairing, diagnostics | 189 |
-| `OpenClaw.Shared.Tests` | Shared models, gateway client, capabilities, MCP, exec approval, A2UI security, URL handling, notification categorization | 1,356 |
-| `OpenClaw.Tray.Tests` | Tray state/UI helpers, settings isolation, onboarding, connection page behavior, localization, local gateway setup/uninstall | 798 |
+| `OpenClaw.Shared.Tests` | Shared models, gateway client, capabilities, MCP, exec approval, A2UI security, URL handling, notification categorization | 1,347 |
+| `OpenClaw.Tray.Tests` | Tray state/UI helpers, settings isolation, onboarding, connection page behavior, localization, local gateway setup/uninstall | 786 |
 | `OpenClaw.Tray.UITests` | Native WinUI/A2UI control and rendering coverage | 50 |
 | `OpenClaw.WinNode.Cli.Tests` | Windows node CLI argument parsing, command behavior, JSON output, uninstall flow | 79 |
 | `OpenClawTray.FunctionalUI.Tests` | Functional UI smoke coverage | 8 |
@@ -37,20 +37,20 @@ The method inventory is a source scan of `[Fact]` and `[Theory]` attributes. Use
 
 ### OpenClaw.Shared.Tests
 
-- **Model and display formatting** — activity glyphs, session labels, gateway usage/node display, channel status, and rich text helpers.
-- **Gateway and WebSocket behavior** — gateway client parsing, session keys, WebSocket base handling, URL normalization, local gateway classification, and token sanitization.
-- **Capabilities and MCP** — app/canvas/screen/camera/system capabilities, MCP auth token reset, MCP HTTP server, MCP tool bridge, MXC availability, MXC policy building, and command runners.
-- **Exec approval** — legacy policy coverage plus V2 evaluator, input validation, normalization, prompt adapter, routing, coordinator, store, environment sanitizing, and shell-wrapper parsing.
-- **A2UI and web bridge** — A2UI capability security, asset hash pinning, web bridge message handling, and channel payload/status tests.
-- **Security and localization-adjacent helpers** — HTTP URL validation/risk evaluation, device identity, identity migration, notification categorization, speech language normalization, and non-fatal action handling.
+- **Model and display formatting** - activity glyphs, app version display, session labels, gateway usage/node display, channel status, and rich text helpers.
+- **Gateway and WebSocket behavior** - gateway client parsing, session keys, WebSocket base handling, URL normalization, local gateway classification, and token sanitization.
+- **Capabilities and MCP** - app/canvas/screen/camera/system capabilities, MCP auth token reset, MCP HTTP server, MCP tool bridge, MXC availability, MXC policy building, and command runners.
+- **Exec approval** - legacy policy coverage plus V2 evaluator, input validation, normalization, prompt adapter, routing, coordinator, store, environment sanitizing, and shell-wrapper parsing.
+- **A2UI and web bridge** - A2UI capability security, asset hash pinning, web bridge message handling, and channel payload/status tests.
+- **Security and localization-adjacent helpers** - HTTP URL validation/risk evaluation, device identity, identity migration, notification categorization, speech language normalization, and non-fatal action handling.
 
 ### OpenClaw.Tray.Tests
 
-- **Tray UI and state** — app state, menu display/position/sizing, tray tooltip formatting, activity streams, async list loading, diagnostics contracts, markup regressions, and chat timeline/markdown handling.
-- **Connection and pairing** — connection manager node connector tests, connection page approval/channel metrics/row state, operator and Windows tray node pairing approval, gateway action transport, and quick-send coordination.
-- **Settings and startup** — settings round-trip/isolation, consent and settings save, auto-start defaults, startup setup state, existing config guard policy, and local setup progress stage mapping.
-- **Onboarding and local gateway setup** — onboarding completion/chat bootstrapper/existing config guard, wizard flow/selection/error/step parsing, setup code decoding, local gateway setup diagnostics, uninstall, WSL keep-alive, and auto-pair flags.
-- **Localization and resources** — localization key parity, capability page localization, fluent icon catalog coverage, and installer assertion tests.
+- **Tray UI and state** - app state, menu display/position/sizing, tray tooltip formatting, activity streams, async list loading, diagnostics contracts, markup regressions, and chat timeline/markdown handling.
+- **Connection and pairing** - connection manager node connector tests, connection page approval/channel metrics/row state, operator and Windows tray node pairing approval, and gateway action transport.
+- **Settings and startup** - settings round-trip/isolation, consent and settings save, auto-start defaults, startup setup state, existing config guard policy, and local setup progress stage mapping.
+- **Onboarding and local gateway setup** - onboarding completion/chat bootstrapper/existing config guard, wizard flow/selection/error/step parsing, setup code decoding, local gateway setup diagnostics, uninstall, WSL keep-alive, and auto-pair flags.
+- **Localization and resources** - localization key parity, capability page localization, fluent icon catalog coverage, and installer assertion tests.
 
 ### Additional projects
 

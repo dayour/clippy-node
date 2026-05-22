@@ -114,11 +114,22 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     // <see cref="ChatTimelineItem"/> record.
     private readonly Dictionary<string, Dictionary<string, ChatEntryMetadata>> _entryMeta = new();
     private SessionInfo[] _sessions = Array.Empty<SessionInfo>();
+    // True once the gateway has delivered a sessions list (even an empty
+    // one) for the current connection. Used to gate the synthetic
+    // compose-only thread so the UI doesn't briefly render the welcome
+    // zero-state in the window between hello-ok (HasHandshakeSnapshot)
+    // and the first sessions.list — at that point the gateway may still
+    // be about to deliver real sessions for a returning user. Reset to
+    // false on disconnect alongside `_status`.
+    private bool _sessionsListReceived;
     private string[] _availableModels = Array.Empty<string>();
     private ConnectionStatus _status;
     private bool _disposed;
 
     public string DisplayName => "OpenClaw gateway";
+
+    /// <summary>Last-known chat state from a previous session, used for pre-connection UI.</summary>
+    internal LastChatState? CachedLastChatState => _lastChatState;
 
     public event EventHandler<ChatDataChangedEventArgs>? Changed;
     public event EventHandler<ChatProviderNotificationEventArgs>? NotificationRequested;
@@ -147,12 +158,17 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         _status = bridge.CurrentStatus;
         _persistedAbortedIds = LoadAbortedIds();
         _toolMetaCache = LoadToolMetaCache(_toolMetaCacheFilePath);
+        _lastChatState = LoadLastChatState();
 
         // Seed models from whatever the bridge already knows about (a connect
         // that completed before the provider was constructed will have its
         // models.list snapshot cached on the bridge).
         if (bridge.GetCurrentModelsList() is { } seedModels)
             _availableModels = ExtractModelNames(seedModels);
+        // Fall back to last-known models so the composer shows a real model
+        // name while reconnecting instead of the generic "model" placeholder.
+        else if (_lastChatState?.AvailableModels is { Length: > 0 } cached)
+            _availableModels = cached;
 
         _bridge.StatusChanged += OnStatusChanged;
         _bridge.SessionsUpdated += OnSessionsUpdated;
@@ -801,13 +817,17 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         if (_disposed) return ValueTask.CompletedTask;
         _disposed = true;
         System.Threading.Timer? timerToDispose;
+        System.Threading.Timer? chatStateTimerToDispose;
         lock (_gate)
         {
             timerToDispose = _toolMetaSaveTimer;
             _toolMetaSaveTimer = null;
             _toolMetaSaveVersion++;
+            chatStateTimerToDispose = _lastChatStateSaveTimer;
+            _lastChatStateSaveTimer = null;
         }
         timerToDispose?.Dispose();
+        chatStateTimerToDispose?.Dispose();
         SaveToolMetaCache();
         _bridge.StatusChanged -= OnStatusChanged;
         _bridge.SessionsUpdated -= OnSessionsUpdated;
@@ -851,6 +871,13 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             var justDisconnected = (status == ConnectionStatus.Disconnected || status == ConnectionStatus.Error)
                                    && _status == ConnectionStatus.Connected;
             _status = status;
+
+            // Reset the sessions-list-received gate whenever we leave the
+            // Connected state. Any cached sessions belong to the previous
+            // connection; the UI must treat the composer as not-yet-ready
+            // until the next sessions.list arrives.
+            if (status != ConnectionStatus.Connected)
+                _sessionsListReceived = false;
 
             // On (re)connect, reload any thread that either previously loaded
             // successfully or has a timeline but never completed loading.
@@ -920,6 +947,7 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         lock (_gate)
         {
             _sessions = sessions ?? Array.Empty<SessionInfo>();
+            _sessionsListReceived = true;
             EnsureTimelinesForSessionsLocked();
             snapshot = BuildSnapshotLocked();
 
@@ -2101,7 +2129,12 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
     {
         if (!_timelines.TryGetValue(threadId, out var current))
         {
-            current = ChatTimelineState.Initial() with { HistoryLoaded = true };
+            // HistoryLoaded stays false until LoadHistoryAsync rebuilds
+            // the timeline from the gateway. The UI relies on this flag
+            // to distinguish "session exists, history still fetching"
+            // (show reconnecting view) from "session truly empty"
+            // (show welcome zero-state).
+            current = ChatTimelineState.Initial();
             _timelines[threadId] = current;
         }
         return current;
@@ -2113,7 +2146,7 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         {
             if (string.IsNullOrEmpty(s.Key)) continue;
             if (!_timelines.ContainsKey(s.Key))
-                _timelines[s.Key] = ChatTimelineState.Initial() with { HistoryLoaded = true };
+                _timelines[s.Key] = ChatTimelineState.Initial();
         }
     }
 
@@ -2131,7 +2164,12 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         var composeKey = _bridge.MainSessionKey;
         var composeReady = _bridge.HasHandshakeSnapshot
             && !string.IsNullOrWhiteSpace(composeKey)
-            && _status == ConnectionStatus.Connected;
+            && _status == ConnectionStatus.Connected
+            // Wait until sessions.list has been delivered for this
+            // connection — otherwise the UI may synthesize a compose-only
+            // thread (and render the welcome zero-state) in the brief
+            // window before a returning user's real sessions arrive.
+            && _sessionsListReceived;
 
         // If the compose target hasn't materialized as a real session yet but
         // already has an optimistic timeline (because the user sent a message
@@ -2150,7 +2188,8 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             threadList.Add(new ChatThread
             {
                 Id = ck,
-                Title = "Main session",
+                Title = _lastChatState?.ThreadTitle ?? "Main session",
+                Model = _lastChatState?.Model,
                 Status = ChatThreadStatus.Running,
                 Activity = ChatActivity.Idle,
             });
@@ -2215,14 +2254,12 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
 
     private static ChatThread ToThread(SessionInfo s)
     {
+        var title = BuildSessionTitle(s);
+
         return new ChatThread
         {
-            // SessionInfo.Key is the canonical gateway session key; we trust
-            // it as-is rather than substituting a literal like "main".
             Id = s.Key ?? string.Empty,
-            Title = !string.IsNullOrWhiteSpace(s.DisplayName)
-                ? s.DisplayName!
-                : (s.IsMain ? "Main session" : s.ShortKey),
+            Title = title,
             Status = ChatThreadStatus.Running,
             Activity = string.IsNullOrEmpty(s.CurrentActivity) ? ChatActivity.Idle : ChatActivity.Working,
             Workspace = s.Channel,
@@ -2231,6 +2268,40 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
             CreatedAt = s.StartedAt is { } st ? ToOffset(st) : null,
             UpdatedAt = s.UpdatedAt is { } ut ? ToOffset(ut) : null,
         };
+    }
+
+    /// <summary>
+    /// Builds a human-readable title from the session key and display name.
+    /// Keys follow the pattern agent:{agentId}:{sessionSlot} (e.g. agent:main:main, agent:assistant:main).
+    /// When a DisplayName is set, we append the agent/slot as a qualifier to disambiguate
+    /// sessions that share the same DisplayName.
+    /// </summary>
+    private static string BuildSessionTitle(SessionInfo s)
+    {
+        var baseName = !string.IsNullOrWhiteSpace(s.DisplayName)
+            ? s.DisplayName!
+            : (s.IsMain ? "Main session" : s.ShortKey);
+
+        // Parse agent:agentId:sessionSlot from the key
+        var parts = (s.Key ?? "").Split(':');
+        if (parts.Length >= 3 && parts[0] == "agent")
+        {
+            var agentId = parts[1];     // e.g. "main", "assistant"
+            var sessionSlot = parts[2]; // e.g. "main", "assistant", "cron"
+
+            // For the canonical main session (agent:main:main), just show the base name
+            if (agentId == "main" && sessionSlot == "main")
+                return baseName;
+
+            // Otherwise, qualify with agent/slot to distinguish
+            var qualifier = agentId == sessionSlot
+                ? agentId                       // e.g. "assistant" when both match
+                : $"{agentId}/{sessionSlot}";   // e.g. "assistant/main"
+
+            return $"{baseName} ({qualifier})";
+        }
+
+        return baseName;
     }
 
     private static DateTimeOffset ToOffset(DateTime dt)
@@ -2253,9 +2324,86 @@ public sealed class OpenClawChatDataProvider : IChatDataProvider
         if (_post is null)
         {
             Changed?.Invoke(this, args);
-            return;
         }
-        _post(() => Changed?.Invoke(this, args));
+        else
+        {
+            _post(() => Changed?.Invoke(this, args));
+        }
+
+        // Debounce-save last-known UI state so the next launch can show
+        // meaningful labels while reconnecting instead of "Main session"/"model".
+        if (snapshot.Threads.Length > 0 || snapshot.AvailableModels.Length > 0)
+            DebounceSaveLastChatState(snapshot);
+    }
+
+    // ── Last-chat-state cache ──────────────────────────────────────────
+    // Persists the last-known thread title, model, and available models so
+    // the UI can show them while reconnecting instead of generic placeholders.
+
+    private static readonly string LastChatStateFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "OpenClawTray", "last-chat-state.json");
+
+    private System.Threading.Timer? _lastChatStateSaveTimer;
+
+    internal sealed class LastChatState
+    {
+        public string? DefaultThreadId { get; set; }
+        public string? ThreadTitle { get; set; }
+        public string? Model { get; set; }
+        public string[]? AvailableModels { get; set; }
+    }
+
+    private LastChatState? _lastChatState;
+
+    internal static LastChatState? LoadLastChatState()
+    {
+        try
+        {
+            if (!File.Exists(LastChatStateFilePath)) return null;
+            var json = File.ReadAllText(LastChatStateFilePath);
+            return System.Text.Json.JsonSerializer.Deserialize<LastChatState>(json);
+        }
+        catch { return null; }
+    }
+
+    private void DebounceSaveLastChatState(ChatDataSnapshot snapshot)
+    {
+        // Find the default thread to capture its title/model
+        var defaultThread = snapshot.DefaultThreadId is { } dtId
+            ? Array.Find(snapshot.Threads, t => t.Id == dtId)
+            : snapshot.Threads.Length > 0 ? snapshot.Threads[0] : null;
+
+        if (defaultThread is null && snapshot.AvailableModels.Length == 0) return;
+
+        var state = new LastChatState
+        {
+            DefaultThreadId = snapshot.DefaultThreadId,
+            ThreadTitle = defaultThread?.Title,
+            Model = defaultThread?.Model,
+            AvailableModels = snapshot.AvailableModels,
+        };
+
+        lock (_gate)
+        {
+            _lastChatState = state;
+            _lastChatStateSaveTimer?.Dispose();
+            _lastChatStateSaveTimer = new System.Threading.Timer(_ => SaveLastChatState(state), null, 2000, Timeout.Infinite);
+        }
+    }
+
+    private static void SaveLastChatState(LastChatState state)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(LastChatStateFilePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            var json = System.Text.Json.JsonSerializer.Serialize(state);
+            var tmp = LastChatStateFilePath + ".tmp";
+            File.WriteAllText(tmp, json);
+            File.Move(tmp, LastChatStateFilePath, overwrite: true);
+        }
+        catch { }
     }
 
     private void RaiseNotification(ChatProviderNotification notification)

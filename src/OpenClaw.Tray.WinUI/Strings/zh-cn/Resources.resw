@@ -287,9 +287,6 @@
   <data name="WindowTitle_NotificationHistory" xml:space="preserve">
     <value>通知历史 — OpenClaw 托盘</value>
   </data>
-  <data name="WindowTitle_QuickSend" xml:space="preserve">
-    <value>快速发送 — OpenClaw</value>
-  </data>
   <data name="WindowTitle_WebChat" xml:space="preserve">
     <value>OpenClaw 聊天</value>
   </data>
@@ -307,30 +304,6 @@
   </data>
   <data name="Status_ConnectionFailed" xml:space="preserve">
     <value>❌ 连接失败</value>
-  </data>
-  <data name="QuickSend_Header" xml:space="preserve">
-    <value>📤 快速发送</value>
-  </data>
-  <data name="QuickSend_Placeholder" xml:space="preserve">
-    <value>输入您的消息...</value>
-  </data>
-  <data name="QuickSend_SendButton" xml:space="preserve">
-    <value>发送</value>
-  </data>
-  <data name="QuickSend_CancelButton" xml:space="preserve">
-    <value>取消</value>
-  </data>
-  <data name="QuickSend_Sending" xml:space="preserve">
-    <value>发送中...</value>
-  </data>
-  <data name="QuickSend_Failed" xml:space="preserve">
-    <value>❌ 发送失败</value>
-  </data>
-  <data name="QuickSend_ToastTitle" xml:space="preserve">
-    <value>消息已发送</value>
-  </data>
-  <data name="QuickSend_ToastBody" xml:space="preserve">
-    <value>您的消息已发送至 OpenClaw。</value>
   </data>
   <data name="Welcome_Title" xml:space="preserve">
     <value>欢迎使用 OpenClaw！</value>
@@ -402,9 +375,6 @@
   </data>
   <data name="Menu_OpenWebChat" xml:space="preserve">
     <value>打开网页聊天</value>
-  </data>
-  <data name="Menu_QuickSend" xml:space="preserve">
-    <value>快速发送...</value>
   </data>
   <data name="Menu_ActivityStream" xml:space="preserve">
     <value>活动流...</value>
@@ -3511,7 +3481,7 @@
     <value>Launch OpenClaw automatically when you sign in.</value>
   </data>
   <data name="SettingsRow_GlobalHotkey_Description.Text" xml:space="preserve">
-    <value>Ctrl + Alt + Shift + C opens the Quick Send dialog from anywhere.</value>
+    <value>Enable global hotkeys (Ctrl+Alt+Shift+V for voice, Ctrl+Alt+; for settings).</value>
   </data>
   <data name="SettingsRow_LegacyChat_Description.Text" xml:space="preserve">
     <value>When on, Chat hosts the gateway's web chat instead of the native Windows experience.</value>

@@ -242,7 +242,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
     // Windows (created on demand)
     private HubWindow? _hubWindow;
     private TrayMenuWindow? _trayMenuWindow;
-    private QuickSendDialog? _quickSendDialog;
     private ChatWindow? _chatWindow;
     private ConnectionStatusWindow? _connectionStatusWindow;
 
@@ -639,7 +638,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         if (_settings.GlobalHotkeyEnabled)
         {
             _globalHotkey = new GlobalHotkeyService();
-            _globalHotkey.HotkeyPressed += OnGlobalHotkeyPressed;
             _globalHotkey.VoiceHotkeyPressed += OnVoiceHotkeyPressed;
             _globalHotkey.SettingsHotkeyPressed += OnSettingsHotkeyPressed;
             _globalHotkey.Register();
@@ -922,7 +920,7 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
                 else
                     ShowHub();
                 break;
-            case "quicksend": ShowQuickSend(); break;
+            case "quicksend": break; // Quick Send removed
             case "history": ShowHub("channels"); break;
             case "activity": ShowHub("channels"); break;
             case "healthcheck": _ = RunHealthCheckAsync(userInitiated: true); break;
@@ -2472,7 +2470,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
             _hubWindow = new HubWindow();
             _hubWindow.AppModel = _appState;
             _hubWindow.ApplyNavPaneState(_settings!);
-            _hubWindow.QuickSendAction = () => ShowQuickSend();
             _hubWindow.OpenSetupAction = () => _ = ShowOnboardingAsync();
             _hubWindow.OpenConnectionStatusAction = ShowConnectionStatusWindow;
             _hubWindow.OpenVoiceAction = () => ShowHub("voice"); // was: ShowVoiceOverlay()
@@ -2613,8 +2610,8 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         if (_settings!.GlobalHotkeyEnabled)
         {
             _globalHotkey ??= new GlobalHotkeyService();
-            _globalHotkey.HotkeyPressed -= OnGlobalHotkeyPressed;
-            _globalHotkey.HotkeyPressed += OnGlobalHotkeyPressed;
+            _globalHotkey.VoiceHotkeyPressed -= OnVoiceHotkeyPressed;
+            _globalHotkey.VoiceHotkeyPressed += OnVoiceHotkeyPressed;
             _globalHotkey.SettingsHotkeyPressed -= OnSettingsHotkeyPressed;
             _globalHotkey.SettingsHotkeyPressed += OnSettingsHotkeyPressed;
             _globalHotkey.Register();
@@ -2662,54 +2659,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         }
 
         ShowHub("chat");
-    }
-
-    private void ShowQuickSend(string? prefillMessage = null)
-    {
-        if (_connectionManager?.OperatorClient == null)
-        {
-            Logger.Warn("QuickSend blocked: gateway client not initialized");
-            return;
-        }
-
-        try
-        {
-            // Keep a strong reference to the window; otherwise the dialog can be GC'd
-            // and appear to not open (especially when triggered from a hotkey).
-            if (_quickSendDialog != null)
-            {
-                // If caller wants a prefill, re-create to apply it.
-                if (!string.IsNullOrEmpty(prefillMessage))
-                {
-                    try { _quickSendDialog.Close(); } catch { }
-                    _quickSendDialog = null;
-                }
-                else
-                {
-                    Logger.Info("QuickSend dialog already open; activating");
-                    _quickSendDialog.ShowAsync();
-                    return;
-                }
-            }
-
-            Logger.Info("Showing QuickSend dialog");
-            // Bug #3: pass a Func that resolves the live OperatorClient on
-            // every Send so post-pair / restart / reinit swaps are observed.
-            var dialog = new QuickSendDialog(() => _connectionManager?.OperatorClient as OpenClawGatewayClient, prefillMessage);
-            dialog.Closed += (s, e) =>
-            {
-                if (ReferenceEquals(_quickSendDialog, dialog))
-                {
-                    _quickSendDialog = null;
-                }
-            };
-            _quickSendDialog = dialog;
-            dialog.ShowAsync();
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"Failed to show QuickSend dialog: {ex.Message}");
-        }
     }
 
     private void ShowStatusDetail()
@@ -3026,7 +2975,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
     }
     void IAppCommands.ShowVoiceOverlay() => ShowHub("voice");
     void IAppCommands.ShowChat() => ShowChatWindow();
-    void IAppCommands.ShowQuickSend() => ShowQuickSend();
     void IAppCommands.CheckForUpdates() => _ = CheckForUpdatesUserInitiatedAsync();
     void IAppCommands.ShowOnboarding() => _ = ShowOnboardingAsync();
     void IAppCommands.ShowConnectionStatus() => ShowConnectionStatusWindow();
@@ -3116,21 +3064,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
         {
             Logger.Warn($"Failed to open {label} folder {folderPath}: {ex.Message}");
-        }
-    }
-
-    private void OnGlobalHotkeyPressed(object? sender, EventArgs e)
-    {
-        if (_dispatcherQueue == null)
-        {
-            Logger.Warn("Hotkey pressed but DispatcherQueue is null");
-            return;
-        }
-
-        var enqueued = _dispatcherQueue.TryEnqueue(() => ShowQuickSend());
-        if (!enqueued)
-        {
-            Logger.Warn("Hotkey pressed but failed to enqueue QuickSend on UI thread");
         }
     }
 
@@ -3793,7 +3726,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
             OpenActivityStream = ShowActivityStream,
             OpenNotificationHistory = ShowNotificationHistory,
             OpenDashboard = OpenDashboard,
-            OpenQuickSend = ShowQuickSend,
             OpenHub = (page) => ShowHub(page),
             OpenVoice = () => ShowHub("voice"), // was: ShowVoiceOverlay()
             StopVoice = () => _ = StopVoiceAsync(),
@@ -3980,8 +3912,6 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         SafeShutdownStep("chat window", () => { _chatWindow?.ForceClose(); _chatWindow = null; });
         SafeShutdownStep("tray menu window", () => CloseWindow(_trayMenuWindow));
         _trayMenuWindow = null;
-        SafeShutdownStep("quick send dialog", () => CloseWindow(_quickSendDialog));
-        _quickSendDialog = null;
         SafeShutdownStep("keep alive window", () => CloseWindow(_keepAliveWindow));
         _keepAliveWindow = null;
 

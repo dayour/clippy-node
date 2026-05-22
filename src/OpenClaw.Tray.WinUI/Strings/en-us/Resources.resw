@@ -49,7 +49,7 @@
     <value>Start automatically with Windows</value>
   </data>
   <data name="SettingsGlobalHotkeyToggle.Header" xml:space="preserve">
-    <value>Global hotkey (Ctrl+Alt+Shift+C → Quick Send)</value>
+    <value>Global hotkeys (voice, settings)</value>
   </data>
   <data name="SettingsNotificationsToggle.Header" xml:space="preserve">
     <value>Show notifications</value>
@@ -312,9 +312,6 @@
   <data name="WindowTitle_NotificationHistory" xml:space="preserve">
     <value>Notification History — OpenClaw Tray</value>
   </data>
-  <data name="WindowTitle_QuickSend" xml:space="preserve">
-    <value>Quick Send — OpenClaw</value>
-  </data>
   <data name="WindowTitle_WebChat" xml:space="preserve">
     <value>OpenClaw Chat</value>
   </data>
@@ -333,31 +330,6 @@
   </data>
   <data name="Status_ConnectionFailed" xml:space="preserve">
     <value>❌ Connection failed</value>
-  </data>
-  <!-- QuickSend dialog -->
-  <data name="QuickSend_Header" xml:space="preserve">
-    <value>📤 Quick Send</value>
-  </data>
-  <data name="QuickSend_Placeholder" xml:space="preserve">
-    <value>Type your message...</value>
-  </data>
-  <data name="QuickSend_SendButton" xml:space="preserve">
-    <value>Send</value>
-  </data>
-  <data name="QuickSend_CancelButton" xml:space="preserve">
-    <value>Cancel</value>
-  </data>
-  <data name="QuickSend_Sending" xml:space="preserve">
-    <value>Sending...</value>
-  </data>
-  <data name="QuickSend_Failed" xml:space="preserve">
-    <value>❌ Failed</value>
-  </data>
-  <data name="QuickSend_ToastTitle" xml:space="preserve">
-    <value>Message Sent</value>
-  </data>
-  <data name="QuickSend_ToastBody" xml:space="preserve">
-    <value>Your message was sent to OpenClaw.</value>
   </data>
   <!-- WelcomeDialog -->
   <data name="Welcome_Title" xml:space="preserve">
@@ -432,9 +404,6 @@
   </data>
   <data name="Menu_OpenWebChat" xml:space="preserve">
     <value>Open Web Chat</value>
-  </data>
-  <data name="Menu_QuickSend" xml:space="preserve">
-    <value>Quick Send...</value>
   </data>
   <data name="Menu_ActivityStream" xml:space="preserve">
     <value>Activity Stream...</value>
@@ -2102,7 +2071,7 @@ On your gateway host (Mac/Linux), run:
     <value>Start automatically with Windows</value>
   </data>
   <data name="GlobalHotkeyToggle.Header" xml:space="preserve">
-    <value>Global hotkey (Ctrl+Alt+Shift+C → Quick Send)</value>
+    <value>Global hotkeys (voice, settings)</value>
   </data>
   <data name="SettingsPage_TextBlock_41.Text" xml:space="preserve">
     <value>Notifications</value>
@@ -3386,7 +3355,7 @@ On your gateway host (Mac/Linux), run:
     <value>Start with Windows</value>
   </data>
   <data name="SettingsRow_GlobalHotkey_Header.Text" xml:space="preserve">
-    <value>Quick Send hotkey</value>
+    <value>Global hotkeys</value>
   </data>
   <data name="SettingsRow_LegacyChat_Header.Text" xml:space="preserve">
     <value>Use gateway's web chat interface</value>
@@ -3560,7 +3529,7 @@ On your gateway host (Mac/Linux), run:
     <value>Launch OpenClaw automatically when you sign in.</value>
   </data>
   <data name="SettingsRow_GlobalHotkey_Description.Text" xml:space="preserve">
-    <value>Ctrl + Alt + Shift + C opens the Quick Send dialog from anywhere.</value>
+    <value>Enable global hotkeys (Ctrl+Alt+Shift+V for voice, Ctrl+Alt+; for settings).</value>
   </data>
   <data name="SettingsRow_LegacyChat_Description.Text" xml:space="preserve">
     <value>When on, Chat hosts the gateway's web chat instead of the native Windows experience.</value>
