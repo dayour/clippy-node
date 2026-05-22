@@ -179,7 +179,7 @@
             <NavigationViewItem x:Uid="HubWindow_Advanced" x:Name="NavAdvanced" Content="Advanced" SelectsOnInvoked="False">
                 <NavigationViewItem.Icon><ImageIcon Source="{StaticResource Advanced_Icon}"/></NavigationViewItem.Icon>
                 <NavigationViewItem.MenuItems>
-                    <NavigationViewItem x:Uid="HubWindow_NavigationViewItem_94" Tag="agentevents" Content="Agent Events">
+                    <NavigationViewItem x:Uid="HubWindow_NavigationViewItem_94" Tag="agentevents" Content="Event Stream">
                         <NavigationViewItem.Icon><ImageIcon Source="{StaticResource AgentEvents_Icon}"/></NavigationViewItem.Icon>
                     </NavigationViewItem>
                     <NavigationViewItem x:Uid="AgentsNavItem" x:Name="AgentsNavItem" Content="Agents" SelectsOnInvoked="False" IsExpanded="True">

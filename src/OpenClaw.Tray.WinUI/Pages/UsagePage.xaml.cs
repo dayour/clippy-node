@@ -73,7 +73,7 @@ public sealed partial class UsagePage : Page
         // Only apply cached cost data when its period matches the current
         // selection — otherwise the daily list briefly shows e.g. 30-day
         // data while the selector reads "7 Days".
-        if (_appState?.UsageCost != null && _appState.UsageCost.Days == _currentPeriodDays)
+        if (_appState?.UsageCost != null && ShouldApplyUsageCost(_appState.UsageCost))
         {
             UpdateUsageCost(_appState.UsageCost);
             _dailyCostLoading.BeginRefresh();
@@ -200,6 +200,9 @@ public sealed partial class UsagePage : Page
         if (cost.UpdatedAt < _lastAppliedUsageCostUpdatedAtUtc)
             return;
 
+        if (!ShouldApplyUsageCost(cost))
+            return;
+
         // The Windows tray fires usage.cost twice per refresh: once via
         // RequestUsageAsync() (always days=30) and once directly via the
         // selector (currently 7 or 30). If the gateway ignores the `days`
@@ -225,6 +228,21 @@ public sealed partial class UsagePage : Page
         }).ToList();
         _dailyCostLoading.Complete(cost.Daily.Count);
         UpdateDailyCostLoadingVisuals();
+    }
+
+    private bool ShouldApplyUsageCost(GatewayCostUsageInfo cost)
+    {
+        if (cost.Days <= 0)
+            return true;
+
+        // The gateway can compute the requested range inclusively (e.g. 8
+        // for a 7-day request). Allow ±1 so valid responses are not dropped.
+        if (Math.Abs(cost.Days - _currentPeriodDays) <= 1)
+            return true;
+
+        // If nothing has ever loaded, accept a mismatched period rather than
+        // leaving the page spinning forever when an older gateway ignores days.
+        return !_dailyCostLoading.HasLoaded;
     }
 
     private void SyncSelectorToServerDays(int days)

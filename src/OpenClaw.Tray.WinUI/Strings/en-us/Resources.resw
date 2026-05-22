@@ -1546,7 +1546,7 @@ On your gateway host (Mac/Linux), run:
     <value>Dashboard → openclaw://dashboard</value>
   </data>
   <data name="AgentEventsPage_TextBlock_18.Text" xml:space="preserve">
-    <value>Agent Events</value>
+    <value>Event Stream</value>
   </data>
   <data name="AgentFilterCombo.Header" xml:space="preserve">
     <value>Agent</value>
@@ -1585,10 +1585,10 @@ On your gateway host (Mac/Linux), run:
     <value>Patch</value>
   </data>
   <data name="AgentEventsPage_TextBlock_96.Text" xml:space="preserve">
-    <value>No agent events yet</value>
+    <value>No events in this session</value>
   </data>
   <data name="AgentEventsPage_TextBlock_99.Text" xml:space="preserve">
-    <value>Real-time agent events (tool calls, responses, errors) will appear here as agents run.</value>
+    <value>Events stream here in real-time as agents run. History clears when the app restarts.</value>
   </data>
   <data name="ClearButton.Content" xml:space="preserve">
     <value>Clear</value>
@@ -2242,7 +2242,7 @@ On your gateway host (Mac/Linux), run:
     <value>Conversations</value>
   </data>
   <data name="HubWindow_NavigationViewItem_94.Content" xml:space="preserve">
-    <value>Agent Events</value>
+    <value>Event Stream</value>
   </data>
   <data name="HubWindow_NavigationViewItem_97.Content" xml:space="preserve">
     <value>Skills</value>

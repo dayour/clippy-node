@@ -16,10 +16,16 @@
 
         <StackPanel Grid.Row="0" Spacing="4" Margin="0,0,0,12">
             <StackPanel Orientation="Horizontal" Spacing="8">
-                <TextBlock x:Uid="AgentEventsPage_TextBlock_18" Text="Agent Events"
-                           Style="{StaticResource TitleTextBlockStyle}"/>
-                <TextBlock x:Name="CountText" Text="(0)"
-                           VerticalAlignment="Bottom" Margin="0,0,0,6"
+                <TextBlock x:Uid="AgentEventsPage_TextBlock_18" Text="Event Stream" Style="{StaticResource TitleTextBlockStyle}"/>
+                <Border x:Name="LiveBadge" CornerRadius="4" Padding="6,2,8,3" VerticalAlignment="Center"
+                        Background="#20FF4444">
+                    <StackPanel Orientation="Horizontal" Spacing="4">
+                        <Ellipse x:Name="LiveDot" Width="6" Height="6" Fill="#FFFF4444" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="LiveText" Text="Live" FontSize="11" FontWeight="SemiBold"
+                                   Foreground="#FFFF4444" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Border>
+                <TextBlock x:Name="CountText" Text="(0)" VerticalAlignment="Center"
                            Style="{StaticResource CaptionTextBlockStyle}"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
             </StackPanel>
@@ -51,21 +57,7 @@
             </Button>
         </Grid>
 
-        <ScrollViewer Grid.Row="2" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled"
-                      Margin="0,0,0,8">
-            <SelectorBar x:Name="FilterSelector"
-                         SelectionChanged="OnFilterSelectionChanged">
-                <SelectorBarItem x:Uid="FilterAllButton" x:Name="FilterAllButton" Text="All" Tag="all" IsSelected="True"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_36" Text="Tool" Tag="tool"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_37" Text="Assistant" Tag="assistant"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_38" Text="Error" Tag="error"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_39" Text="Lifecycle" Tag="lifecycle"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_40" Text="Plan" Tag="plan"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_41" Text="Approval" Tag="approval"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_42" Text="Thinking" Tag="thinking"/>
-                <SelectorBarItem x:Uid="AgentEventsPage_ToggleButton_43" Text="Patch" Tag="patch"/>
-            </SelectorBar>
-        </ScrollViewer>
+        <!-- Filter bar — removed; agent dropdown + live badge provide enough context -->
 
         <ListView x:Name="EventsList" Grid.Row="3"
                   SelectionMode="None"
@@ -142,16 +134,14 @@
             </ListView.ItemTemplate>
         </ListView>
 
-        <StackPanel x:Name="EmptyState" Grid.Row="3"
-                    VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="12">
-            <FontIcon Glyph="{x:Bind helpers:FluentIconCatalog.AgentEvents, Mode=OneTime}"
-                      FontSize="48" IsTextScaleFactorEnabled="False"
-                      Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                      HorizontalAlignment="Center"/>
-            <TextBlock x:Uid="AgentEventsPage_TextBlock_96" Text="No agent events yet"
+        <!-- Empty state -->
+        <StackPanel x:Name="EmptyState" Grid.Row="2"
+                    VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="8">
+            <TextBlock Text="🤖" FontSize="48" HorizontalAlignment="Center"/>
+            <TextBlock x:Uid="AgentEventsPage_TextBlock_96" Text="No events in this session"
                        Style="{StaticResource SubtitleTextBlockStyle}"
                        HorizontalAlignment="Center"/>
-            <TextBlock x:Uid="AgentEventsPage_TextBlock_99" Text="Real-time agent events (tool calls, responses, errors) will appear here as agents run."
+            <TextBlock x:Uid="AgentEventsPage_TextBlock_99" Text="Events stream here in real-time as agents run. History clears when the app restarts."
                        Style="{StaticResource CaptionTextBlockStyle}"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                        HorizontalAlignment="Center" TextWrapping="Wrap" MaxWidth="320"/>

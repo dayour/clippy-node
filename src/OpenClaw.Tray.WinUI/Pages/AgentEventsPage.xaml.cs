@@ -13,7 +13,6 @@ public sealed partial class AgentEventsPage : Page
 {
     private const int MaxEvents = 400;
     private readonly List<AgentEventInfo> _allEvents = new();
-    private string _activeFilter = "all";
     private string? _agentIdFilter;
     private bool _filterDirty;
     private AppState? _appState;
@@ -84,6 +83,35 @@ public sealed partial class AgentEventsPage : Page
         _appState.AgentEventAdded += OnAgentEventAdded;
         _appState.PropertyChanged += OnAppStateChanged;
         PopulateAgentFilter(hub);
+        UpdateLiveBadge();
+    }
+
+    private void UpdateLiveBadge()
+    {
+        var connected = _appState?.Status == ConnectionStatus.Connected;
+        DispatcherQueue?.TryEnqueue(() =>
+        {
+            if (connected)
+            {
+                LiveDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                    Microsoft.UI.ColorHelper.FromArgb(255, 255, 68, 68));
+                LiveText.Text = "Live";
+                LiveText.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                    Microsoft.UI.ColorHelper.FromArgb(255, 255, 68, 68));
+                LiveBadge.Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                    Microsoft.UI.ColorHelper.FromArgb(32, 255, 68, 68));
+            }
+            else
+            {
+                LiveDot.Fill = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                    Microsoft.UI.ColorHelper.FromArgb(255, 128, 128, 128));
+                LiveText.Text = "Offline";
+                LiveText.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                    Microsoft.UI.ColorHelper.FromArgb(255, 128, 128, 128));
+                LiveBadge.Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                    Microsoft.UI.ColorHelper.FromArgb(32, 128, 128, 128));
+            }
+        });
     }
 
     private void OnAppStateChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -92,6 +120,10 @@ public sealed partial class AgentEventsPage : Page
         {
             _allEvents.Clear();
             ApplyFilter();
+        }
+        else if (e.PropertyName == nameof(AppState.Status))
+        {
+            UpdateLiveBadge();
         }
     }
 
@@ -131,12 +163,6 @@ public sealed partial class AgentEventsPage : Page
         }
     }
 
-    private void OnFilterSelectionChanged(SelectorBar sender, SelectorBarSelectionChangedEventArgs args)
-    {
-        var tag = sender.SelectedItem?.Tag as string;
-        _activeFilter = string.IsNullOrEmpty(tag) ? "all" : tag;
-        ApplyFilter();
-    }
 
     private void ApplyFilter()
     {
@@ -146,10 +172,6 @@ public sealed partial class AgentEventsPage : Page
         if (!string.IsNullOrEmpty(_agentIdFilter))
             filtered = filtered.Where(e => e.SessionKey != null &&
                 e.SessionKey.StartsWith($"agent:{_agentIdFilter}:", StringComparison.OrdinalIgnoreCase));
-
-        // Filter by stream type (use ResolvedStream so "item" events with kind:"tool" match the Tool filter)
-        if (_activeFilter != "all")
-            filtered = filtered.Where(e => e.ResolvedStream.Equals(_activeFilter, StringComparison.OrdinalIgnoreCase));
 
         var list = filtered.ToList();
         EventsList.ItemsSource = list;
