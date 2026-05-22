@@ -146,6 +146,10 @@ public class LocalizationValidationTests
         "ConnectionPage_NodePairing_Subtitle.Text",
         "AboutPage_MoreDiagnosticsLink.Content",
         "ConnectionStatusWindow.Title",
+        // AgentEventsPage subtitle — seeded English-only across all locales
+        // until translations land. Same precedent as the PermissionsPage
+        // runtime keys above.
+        "AgentEventsPage_IntroText.Text",
     };
 
     private static readonly string[] RequiredRuntimeOnboardingKeys =

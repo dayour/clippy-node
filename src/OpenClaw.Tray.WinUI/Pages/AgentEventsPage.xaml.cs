@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Controls.Primitives;
 using OpenClaw.Shared;
 using OpenClawTray.Services;
 using OpenClawTray.Windows;
@@ -121,18 +120,10 @@ public sealed partial class AgentEventsPage : Page
         }
     }
 
-    private void OnFilterClick(object sender, RoutedEventArgs e)
+    private void OnFilterSelectionChanged(SelectorBar sender, SelectorBarSelectionChangedEventArgs args)
     {
-        if (sender is not ToggleButton clicked) return;
-        var tag = clicked.Tag?.ToString() ?? "all";
-
-        foreach (var child in ((StackPanel)clicked.Parent).Children)
-        {
-            if (child is ToggleButton tb)
-                tb.IsChecked = tb == clicked;
-        }
-
-        _activeFilter = tag;
+        var tag = sender.SelectedItem?.Tag as string;
+        _activeFilter = string.IsNullOrEmpty(tag) ? "all" : tag;
         ApplyFilter();
     }
 
@@ -190,9 +181,13 @@ public sealed partial class AgentEventsPage : Page
                     Microsoft.UI.ColorHelper.FromArgb(40, 100, 100, 100));
             }
 
-            // Update chevron glyph based on model state
+            // Update chevron glyph based on model state, and hide it
+            // entirely when there is nothing to expand.
             if (headerGrid.Children.Count > 2 && headerGrid.Children[2] is FontIcon chevron)
+            {
+                chevron.Visibility = evt.CanExpand ? Visibility.Visible : Visibility.Collapsed;
                 chevron.Glyph = evt.IsExpanded ? "\uE70E" : "\uE70D";
+            }
         }
 
         // Row 1: summary
@@ -230,6 +225,8 @@ public sealed partial class AgentEventsPage : Page
     private void EventsList_ItemClick(object sender, ItemClickEventArgs e)
     {
         if (e.ClickedItem is not AgentEventInfo evt) return;
+        // Ignore clicks for events with nothing to reveal.
+        if (!evt.CanExpand) return;
         evt.IsExpanded = !evt.IsExpanded;
 
         // Update the visual container

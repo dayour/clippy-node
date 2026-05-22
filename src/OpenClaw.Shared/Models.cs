@@ -1776,6 +1776,25 @@ public class AgentEventInfo
         }
     }
 
+    /// <summary>
+    /// True when expanding the row reveals additional content beyond
+    /// <see cref="SummaryLine"/>. Drives whether the chevron and
+    /// click-to-expand affordance render on the Agent Events page.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool CanExpand
+    {
+        get
+        {
+            if (IsAssistantStream)
+            {
+                var full = FullAssistantText;
+                return !string.IsNullOrEmpty(full) && full != SummaryLine;
+            }
+            return ShowDataJson;
+        }
+    }
+
     // UI-only state for expand/collapse (not serialized)
     [System.Text.Json.Serialization.JsonIgnore]
     public bool IsExpanded { get; set; }
