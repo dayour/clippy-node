@@ -12,6 +12,11 @@ on:
           - all
           - csharp
           - actions
+      advanced_setup:
+        description: Run advanced CodeQL instead of repository default setup
+        required: false
+        default: false
+        type: boolean
   push:
     paths:
       - ".github/codeql/**"
@@ -55,33 +60,31 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  default-setup:
-    name: Detect default setup
+  advanced-setup:
+    name: Advanced setup gate
     runs-on: ubuntu-latest
     outputs:
-      enabled: ${{ steps.default-setup.outputs.enabled }}
+      enabled: ${{ steps.advanced-setup.outputs.enabled }}
     steps:
-      - name: Check CodeQL default setup
-        id: default-setup
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Decide whether to run advanced CodeQL
+        id: advanced-setup
         run: |
-          state="$(gh api "repos/${GITHUB_REPOSITORY}/code-scanning/default-setup" --jq .state 2>/dev/null || true)"
-          if [ "$state" = "configured" ]; then
+          if [ "${{ vars.OPENCLAW_CODEQL_ADVANCED_SETUP }}" = "true" ] || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.advanced_setup }}" = "true" ]; }; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-            {
-              echo "CodeQL default setup is already configured for this repository."
-              echo "Skipping this advanced workflow because GitHub rejects advanced CodeQL SARIF uploads while default setup is enabled."
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Advanced CodeQL enabled for this run." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "CodeQL default setup state: ${state:-unavailable}" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "Advanced CodeQL is disabled for this repository workflow."
+              echo "The repository currently uses GitHub CodeQL default setup; default setup and advanced setup cannot upload SARIF for the same repository at the same time."
+              echo "If maintainers disable default setup, set OPENCLAW_CODEQL_ADVANCED_SETUP=true or dispatch this workflow with advanced_setup=true."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
   csharp:
     name: C# security
-    needs: default-setup
-    if: ${{ needs.default-setup.outputs.enabled != 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'csharp') }}
+    needs: advanced-setup
+    if: ${{ needs.advanced-setup.outputs.enabled == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'csharp') }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -115,8 +118,8 @@ jobs:
 
   actions:
     name: Actions security
-    needs: default-setup
-    if: ${{ needs.default-setup.outputs.enabled != 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'actions') }}
+    needs: advanced-setup
+    if: ${{ needs.advanced-setup.outputs.enabled == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event_name != 'workflow_dispatch' || inputs.profile == 'all' || inputs.profile == 'actions') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
