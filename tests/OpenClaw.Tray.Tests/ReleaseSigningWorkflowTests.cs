@@ -40,6 +40,26 @@ public sealed class ReleaseSigningWorkflowTests
         Assert.Contains("Unknown executable in release payload", verifier);
     }
 
+    [Fact]
+    public void ReleaseWorkflow_PausesMsixForAlpha()
+    {
+        var workflow = File.ReadAllText(Path.Combine(GetRepositoryRoot(), ".github", "workflows", "ci.yml"));
+
+        Assert.Contains("if: false # Paused for alpha.4; ship Inno setup and portable ZIP artifacts only.", workflow);
+        Assert.Contains("needs: [repo-hygiene, test, e2etests, build]", workflow);
+        Assert.DoesNotContain("Download win-x64 MSIX artifact", workflow);
+        Assert.DoesNotContain("Download win-arm64 MSIX artifact", workflow);
+        Assert.DoesNotContain("Sign Release MSIX Packages", workflow);
+        Assert.DoesNotContain(".msix", ExtractReleaseStep(workflow));
+    }
+
+    private static string ExtractReleaseStep(string workflow)
+    {
+        var start = workflow.IndexOf("    - name: Create Release", StringComparison.Ordinal);
+        Assert.True(start >= 0, "Could not find Create Release step.");
+        return workflow[start..];
+    }
+
     private static string GetRepositoryRoot()
     {
         var env = Environment.GetEnvironmentVariable("OPENCLAW_REPO_ROOT");

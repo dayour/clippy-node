@@ -435,6 +435,7 @@ jobs:
 
   build-msix:
     needs: [test, e2etests]
+    if: false # Paused for alpha.4; ship Inno setup and portable ZIP artifacts only.
     runs-on: ${{ matrix.rid == 'win-arm64' && 'windows-11-arm' || 'windows-latest' }}
     continue-on-error: true
     strategy:
@@ -527,7 +528,7 @@ jobs:
         path: ${{ steps.find-msix.outputs.msix_path }}
 
   release:
-    needs: [repo-hygiene, test, e2etests, build, build-msix]
+    needs: [repo-hygiene, test, e2etests, build]
     if: startsWith(github.ref, 'refs/tags/v') && needs.repo-hygiene.result == 'success' && needs.test.result == 'success' && needs.e2etests.result == 'success' && needs.build.result == 'success' && !cancelled()
     runs-on: windows-latest
     permissions:
@@ -548,32 +549,6 @@ jobs:
       with:
         name: openclaw-tray-win-arm64
         path: artifacts/tray-win-arm64
-
-    - name: Download win-x64 MSIX artifact
-      uses: actions/download-artifact@v8
-      continue-on-error: true
-      id: msix-x64
-      with:
-        name: openclaw-msix-win-x64
-        path: artifacts/msix-x64
-
-    - name: Download win-arm64 MSIX artifact
-      uses: actions/download-artifact@v8
-      continue-on-error: true
-      id: msix-arm64
-      with:
-        name: openclaw-msix-win-arm64
-        path: artifacts/msix-arm64
-
-    - name: Rename MSIX packages
-      if: steps.msix-x64.outcome == 'success' || steps.msix-arm64.outcome == 'success'
-      shell: pwsh
-      run: |
-        $assetVersion = "${{ needs.test.outputs.semVer }}"
-        $x64 = Get-ChildItem -Path artifacts/msix-x64 -Filter "*.msix" | Select-Object -First 1
-        $arm64 = Get-ChildItem -Path artifacts/msix-arm64 -Filter "*.msix" | Select-Object -First 1
-        if ($x64) { Copy-Item $x64.FullName "OpenClawCompanion-$assetVersion-win-x64.msix" }
-        if ($arm64) { Copy-Item $arm64.FullName "OpenClawCompanion-$assetVersion-win-arm64.msix" }
 
     - name: Disable NuGet source mapping for signing
       shell: pwsh
@@ -615,23 +590,6 @@ jobs:
     - name: Verify ARM64 Release Executable Signing Policy
       shell: pwsh
       run: .\scripts\Test-ReleaseExecutableSignatures.ps1 -PayloadPath artifacts/tray-win-arm64 -RequireSignedOpenClaw
-
-    - name: Sign Release MSIX Packages
-      if: steps.msix-x64.outcome == 'success' || steps.msix-arm64.outcome == 'success'
-      uses: azure/trusted-signing-action@v2
-      with:
-        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-        endpoint: https://wus2.codesigning.azure.net/
-        signing-account-name: hanselman
-        certificate-profile-name: WindowsEdgeLight
-        files-folder: .
-        files-folder-filter: msix
-        files-folder-depth: 1
-        file-digest: SHA256
-        timestamp-rfc3161: http://timestamp.acs.microsoft.com
-        timestamp-digest: SHA256
 
     # Create ZIP files for Updatum auto-update (needs "win-x64" in filename)
     - name: Create Release ZIPs
@@ -688,8 +646,6 @@ jobs:
           Output/OpenClawCompanion-Setup-arm64.exe
           OpenClawTray-${{ needs.test.outputs.semVer }}-win-x64.zip
           OpenClawTray-${{ needs.test.outputs.semVer }}-win-arm64.zip
-          OpenClawCompanion-${{ needs.test.outputs.semVer }}-win-x64.msix
-          OpenClawCompanion-${{ needs.test.outputs.semVer }}-win-arm64.msix
         prerelease: ${{ contains(github.ref_name, '-') }}
         make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
         body: |
@@ -700,8 +656,6 @@ jobs:
           - **Installer (ARM64)**: `OpenClawCompanion-Setup-arm64.exe` - Windows on ARM (Surface, etc.)
           - **Portable x64**: `OpenClawTray-${{ needs.test.outputs.semVer }}-win-x64.zip`
           - **Portable ARM64**: `OpenClawTray-${{ needs.test.outputs.semVer }}-win-arm64.zip`
-          - **MSIX x64**: `OpenClawCompanion-${{ needs.test.outputs.semVer }}-win-x64.msix` - Packaged (camera/mic consent)
-          - **MSIX ARM64**: `OpenClawCompanion-${{ needs.test.outputs.semVer }}-win-arm64.msix` - Packaged (camera/mic consent)
 
           ### Features
           - 🦞 System tray integration with gateway status
