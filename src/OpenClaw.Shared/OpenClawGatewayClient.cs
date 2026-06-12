@@ -1497,9 +1497,7 @@ public class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatewayClient
         if (string.IsNullOrWhiteSpace(requestId)) return null;
         lock (_pendingRequestLock)
         {
-            if (!_pendingRequestMethods.TryGetValue(requestId, out var method)) return null;
-            _pendingRequestMethods.Remove(requestId);
-            return method;
+            return _pendingRequestMethods.Remove(requestId, out var method) ? method : null;
         }
     }
 
@@ -1579,13 +1577,7 @@ public class OpenClawGatewayClient : WebSocketClientBase, IOperatorGatewayClient
 
         lock (_pendingChatSendLock)
         {
-            if (!_pendingChatSendRequests.TryGetValue(requestId, out var completion))
-            {
-                return null;
-            }
-
-            _pendingChatSendRequests.Remove(requestId);
-            return completion;
+            return _pendingChatSendRequests.Remove(requestId, out var completion) ? completion : null;
         }
     }
 
