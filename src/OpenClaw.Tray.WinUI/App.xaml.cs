@@ -2072,7 +2072,13 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         {
             if (args.Status == OpenClaw.Shared.PairingStatus.Pending)
             {
-                ShowPairingPendingNotification(args.DeviceId);
+                var approvalCommand = args.ApprovalKind switch
+                {
+                    OpenClaw.Shared.PairingApprovalKind.DevicePair => BuildPairingApprovalCommand(args.DeviceId),
+                    OpenClaw.Shared.PairingApprovalKind.NodePair => CommandCenterDiagnostics.BuildNodeApprovalRepairCommand(args.RequestId),
+                    _ => CommandCenterDiagnostics.BuildUnknownPairingDiscoveryCommands()
+                };
+                ShowPairingPendingNotification(args.DeviceId, approvalCommand);
             }
             else if (args.Status == OpenClaw.Shared.PairingStatus.Paired)
             {
@@ -2990,6 +2996,9 @@ public partial class App : Application, OpenClawTray.Services.IAppCommands
         LastUpdateInfo = _appState!.UpdateInfo,
         Settings = _settings,
         NodeService = _nodeService,
+        NodePairingApprovalKind = _connectionManager?.CurrentSnapshot.NodePairingApprovalKind
+            ?? PairingApprovalKind.Unknown,
+        NodePairingRequestId = _connectionManager?.CurrentSnapshot.NodePairingRequestId,
         SshTunnelSnapshot = _sshTunnelService?.CreateSnapshot(),
         HasGatewayClient = _connectionManager?.OperatorClient != null
     };

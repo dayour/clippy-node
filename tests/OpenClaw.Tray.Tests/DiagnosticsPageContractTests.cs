@@ -60,6 +60,31 @@ public sealed class DiagnosticsPageContractTests
     }
 
     [Fact]
+    public void CommandCenterTextHelper_NodeInventoryIncludesTrustDiagnostics()
+    {
+        var helper = Read("src", "OpenClaw.Tray.WinUI", "Helpers", "CommandCenterTextHelper.cs");
+
+        Assert.Contains("BuildNodeInventorySummary", helper);
+        Assert.Contains("OpenClaw node inventory", helper);
+        Assert.Contains("Approved/effective capabilities", helper);
+        Assert.Contains("Approved/effective commands", helper);
+        Assert.Contains("Pending declared capabilities", helper);
+        Assert.Contains("Pending declared commands", helper);
+        Assert.Contains("Local declared/unverified capabilities", helper);
+        Assert.Contains("Local declared/unverified commands", helper);
+        Assert.Contains("Approval command", helper);
+        Assert.Contains("Pending request discovery command", helper);
+        Assert.Contains("TryBuildNodeApprovalCommand", helper);
+        Assert.Contains("Safe approved commands", helper);
+        Assert.Contains("Privacy-sensitive approved commands", helper);
+        Assert.Contains("Browser proxy approved commands", helper);
+        Assert.Contains("Missing browser proxy allowlist", helper);
+        Assert.Contains("Disabled in Settings", helper);
+        Assert.Contains("Missing Mac parity", helper);
+        Assert.DoesNotContain("NodePairApproveAsync", helper);
+    }
+
+    [Fact]
     public void TrayLogWriters_SanitizeSensitiveValuesBeforeWriting()
     {
         var logger = Read("src", "OpenClaw.Tray.WinUI", "Services", "Logger.cs");
