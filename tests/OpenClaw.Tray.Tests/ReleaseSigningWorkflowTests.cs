@@ -82,7 +82,7 @@ public sealed class ReleaseSigningWorkflowTests
         Assert.Contains("Get-AuthenticodeSignature -LiteralPath $File.FullName", verifier);
         Assert.Contains("Get-VCRuntimeFiles", verifier);
         Assert.Contains("vcruntime140.dll", verifier);
-        Assert.Contains("libsodium.dll", verifier);
+        Assert.DoesNotContain("libsodium.dll", verifier);
         Assert.Contains("OpenClawNativeDependencyProbe", verifier);
         Assert.Contains("Microsoft.ML.OnnxRuntime.dll", verifier);
         Assert.Contains("onnxruntime.dll", verifier);
@@ -96,11 +96,11 @@ public sealed class ReleaseSigningWorkflowTests
     }
 
     [Fact]
-    public void ReleaseWorkflow_PausesMsixForAlpha()
+    public void ReleaseWorkflow_PausesMsixDistribution()
     {
         var workflow = File.ReadAllText(Path.Combine(TestRepositoryPaths.GetRepositoryRoot(), ".github", "workflows", "ci.yml"));
 
-        Assert.Contains("if: false # Paused for alpha.4; ship Inno setup and portable ZIP artifacts only.", workflow);
+        Assert.Contains("if: false # MSIX distribution is paused; ship Inno setup and portable ZIP artifacts only.", workflow);
         Assert.Contains("needs: [repo-hygiene, test, e2etests, build]", workflow);
         Assert.DoesNotContain("Download win-x64 MSIX artifact", workflow);
         Assert.DoesNotContain("Download win-arm64 MSIX artifact", workflow);

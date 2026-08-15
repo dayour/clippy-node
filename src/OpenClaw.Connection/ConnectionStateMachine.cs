@@ -12,7 +12,18 @@ internal sealed class ConnectionStateMachine
     private RoleConnectionState _operatorState = RoleConnectionState.Idle;
     private RoleConnectionState _nodeState = RoleConnectionState.Idle;
     private string? _operatorError;
+    private OpenClaw.Shared.GatewayErrorKind? _operatorErrorKind;
     private string? _nodeError;
+    private string? _operatorCredentialSource;
+    private string? _nodeCredentialSource;
+    private GatewayCredentialResolutionStatus? _operatorCredentialStatus;
+    private GatewayCredentialResolutionStatus? _nodeCredentialStatus;
+    private bool _operatorCredentialFallbackUsed;
+    private bool _nodeCredentialFallbackUsed;
+    private bool _operatorCredentialBootstrapRequired;
+    private bool _nodeCredentialBootstrapRequired;
+    private string? _operatorCredentialDetail;
+    private string? _nodeCredentialDetail;
     private bool _nodeEnabled;
 
     /// <summary>
@@ -121,9 +132,20 @@ internal sealed class ConnectionStateMachine
     {
         _nodeEnabled = enabled;
         if (!enabled)
+        {
             _nodeState = RoleConnectionState.Disabled;
+            _nodeError = null;
+            _nodeCredentialSource = null;
+            _nodeCredentialStatus = null;
+            _nodeCredentialFallbackUsed = false;
+            _nodeCredentialBootstrapRequired = false;
+            _nodeCredentialDetail = null;
+        }
         else if (_nodeState == RoleConnectionState.Disabled)
+        {
             _nodeState = RoleConnectionState.Idle;
+            _nodeError = null;
+        }
         RebuildSnapshot();
     }
 
@@ -133,7 +155,18 @@ internal sealed class ConnectionStateMachine
         _operatorState = RoleConnectionState.Idle;
         _nodeState = _nodeEnabled ? RoleConnectionState.Idle : RoleConnectionState.Disabled;
         _operatorError = null;
+        _operatorErrorKind = null;
         _nodeError = null;
+        _operatorCredentialSource = null;
+        _nodeCredentialSource = null;
+        _operatorCredentialStatus = null;
+        _nodeCredentialStatus = null;
+        _operatorCredentialFallbackUsed = false;
+        _nodeCredentialFallbackUsed = false;
+        _operatorCredentialBootstrapRequired = false;
+        _nodeCredentialBootstrapRequired = false;
+        _operatorCredentialDetail = null;
+        _nodeCredentialDetail = null;
         RebuildSnapshot();
     }
 
@@ -152,6 +185,34 @@ internal sealed class ConnectionStateMachine
     internal void SetOperatorDeviceId(string? deviceId)
     {
         Current = Current with { OperatorDeviceId = deviceId };
+    }
+
+    internal void SetOperatorCredentialSource(string? source)
+    {
+        _operatorCredentialSource = source;
+        _operatorCredentialStatus = string.IsNullOrEmpty(source)
+            ? null
+            : GatewayCredentialResolutionStatus.Resolved;
+        _operatorCredentialFallbackUsed = false;
+        _operatorCredentialBootstrapRequired = false;
+        _operatorCredentialDetail = null;
+        RebuildSnapshot();
+    }
+
+    internal void SetOperatorCredentialResolution(GatewayCredentialResolution resolution)
+    {
+        _operatorCredentialSource = resolution.Credential?.Source;
+        _operatorCredentialStatus = resolution.Status;
+        _operatorCredentialFallbackUsed = resolution.FallbackUsed;
+        _operatorCredentialBootstrapRequired = resolution.BootstrapRequired;
+        _operatorCredentialDetail = resolution.Detail;
+        RebuildSnapshot();
+    }
+
+    internal void SetOperatorErrorKind(OpenClaw.Shared.GatewayErrorKind? kind)
+    {
+        _operatorErrorKind = kind;
+        RebuildSnapshot();
     }
 
     /// <summary>Update node info (device ID, pairing status, optional request ID) in the snapshot.</summary>
@@ -183,6 +244,49 @@ internal sealed class ConnectionStateMachine
         };
     }
 
+    internal void SetNodeCredentialSource(string? source)
+    {
+        _nodeCredentialSource = source;
+        _nodeCredentialStatus = string.IsNullOrEmpty(source)
+            ? null
+            : GatewayCredentialResolutionStatus.Resolved;
+        _nodeCredentialFallbackUsed = false;
+        _nodeCredentialBootstrapRequired = false;
+        _nodeCredentialDetail = null;
+        RebuildSnapshot();
+    }
+
+    internal void SetNodeCredentialResolution(GatewayCredentialResolution resolution)
+    {
+        _nodeCredentialSource = resolution.Credential?.Source;
+        _nodeCredentialStatus = resolution.Status;
+        _nodeCredentialFallbackUsed = resolution.FallbackUsed;
+        _nodeCredentialBootstrapRequired = resolution.BootstrapRequired;
+        _nodeCredentialDetail = resolution.Detail;
+        RebuildSnapshot();
+    }
+
+    internal void BlockNodeStart(string detail, bool preserveCredentialResolution = false)
+    {
+        _nodeEnabled = true;
+        _nodeState = RoleConnectionState.Error;
+        _nodeError = detail;
+        _nodeCredentialSource = null;
+        if (!preserveCredentialResolution)
+        {
+            _nodeCredentialStatus = null;
+            _nodeCredentialFallbackUsed = false;
+            _nodeCredentialBootstrapRequired = false;
+            _nodeCredentialDetail = null;
+        }
+        else
+        {
+            _nodeCredentialStatus ??= GatewayCredentialResolutionStatus.Missing;
+            _nodeCredentialDetail ??= detail;
+        }
+        RebuildSnapshot();
+    }
+
     /// <summary>Update the operator pairing request ID in the snapshot.</summary>
     internal void SetOperatorPairingRequestId(string? requestId)
     {
@@ -197,6 +301,7 @@ internal sealed class ConnectionStateMachine
             case ConnectionTrigger.ConnectRequested:
                 _operatorState = RoleConnectionState.Connecting;
                 _operatorError = null;
+                _operatorErrorKind = null;
                 break;
 
             case ConnectionTrigger.ConnectRequestSent:
@@ -208,6 +313,7 @@ internal sealed class ConnectionStateMachine
             case ConnectionTrigger.HandshakeSucceeded:
                 _operatorState = RoleConnectionState.Connected;
                 _operatorError = null;
+                _operatorErrorKind = null;
                 break;
 
             case ConnectionTrigger.PairingPending:
@@ -221,16 +327,19 @@ internal sealed class ConnectionStateMachine
             case ConnectionTrigger.PairingRejected:
                 _operatorState = RoleConnectionState.Error;
                 _operatorError = detail ?? "Pairing rejected";
+                _operatorErrorKind = OpenClaw.Shared.GatewayErrorKind.PairingRejected;
                 break;
 
             case ConnectionTrigger.AuthenticationFailed:
                 _operatorState = RoleConnectionState.Error;
                 _operatorError = detail ?? "Authentication failed";
+                _operatorErrorKind ??= OpenClaw.Shared.GatewayErrorClassifier.ClassifyWithCode(_operatorError);
                 break;
 
             case ConnectionTrigger.RateLimited:
                 _operatorState = RoleConnectionState.Error;
                 _operatorError = detail ?? "Rate limited";
+                _operatorErrorKind = OpenClaw.Shared.GatewayErrorKind.RateLimited;
                 break;
 
             case ConnectionTrigger.WebSocketDisconnected:
@@ -243,12 +352,14 @@ internal sealed class ConnectionStateMachine
                 {
                     _operatorState = RoleConnectionState.Connecting;
                     _operatorError = null;
+                    _operatorErrorKind = null;
                 }
                 break;
 
             case ConnectionTrigger.WebSocketError:
                 _operatorState = RoleConnectionState.Error;
                 _operatorError = detail ?? "WebSocket error";
+                _operatorErrorKind ??= OpenClaw.Shared.GatewayErrorClassifier.Classify(_operatorError);
                 break;
 
             case ConnectionTrigger.DisconnectRequested:
@@ -256,12 +367,24 @@ internal sealed class ConnectionStateMachine
                 _operatorState = RoleConnectionState.Idle;
                 _nodeState = _nodeEnabled ? RoleConnectionState.Idle : RoleConnectionState.Disabled;
                 _operatorError = null;
+                _operatorErrorKind = null;
                 _nodeError = null;
+                _operatorCredentialSource = null;
+                _nodeCredentialSource = null;
+                _operatorCredentialStatus = null;
+                _nodeCredentialStatus = null;
+                _operatorCredentialFallbackUsed = false;
+                _nodeCredentialFallbackUsed = false;
+                _operatorCredentialBootstrapRequired = false;
+                _nodeCredentialBootstrapRequired = false;
+                _operatorCredentialDetail = null;
+                _nodeCredentialDetail = null;
                 break;
 
             case ConnectionTrigger.ReconnectScheduled:
                 _operatorState = RoleConnectionState.Connecting;
                 _operatorError = null;
+                _operatorErrorKind = null;
                 break;
 
             case ConnectionTrigger.ReconnectSuppressed:
@@ -271,6 +394,7 @@ internal sealed class ConnectionStateMachine
             case ConnectionTrigger.Cancelled:
                 _operatorState = RoleConnectionState.Idle;
                 _operatorError = null;
+                _operatorErrorKind = null;
                 break;
 
             // ─── Node transitions ───
@@ -286,6 +410,7 @@ internal sealed class ConnectionStateMachine
 
             case ConnectionTrigger.NodePairingRequired:
                 _nodeState = RoleConnectionState.PairingRequired;
+                _nodeError = null;
                 break;
 
             case ConnectionTrigger.NodePaired:
@@ -317,12 +442,24 @@ internal sealed class ConnectionStateMachine
             OverallState = GatewayConnectionSnapshot.DeriveOverall(_operatorState, _nodeState, _nodeEnabled),
             OperatorState = _operatorState,
             OperatorError = _operatorError,
+            OperatorErrorKind = _operatorErrorKind,
+            OperatorCredentialSource = _operatorCredentialSource,
+            OperatorCredentialStatus = _operatorCredentialStatus,
+            OperatorCredentialFallbackUsed = _operatorCredentialFallbackUsed,
+            OperatorCredentialBootstrapRequired = _operatorCredentialBootstrapRequired,
+            OperatorCredentialDetail = _operatorCredentialDetail,
             OperatorPairingRequired = _operatorState == RoleConnectionState.PairingRequired,
             // Clear requestId when no longer in PairingRequired to prevent stale reads
             OperatorPairingRequestId = _operatorState == RoleConnectionState.PairingRequired
                 ? Current.OperatorPairingRequestId : null,
+            NodeConnectionIntended = _nodeEnabled,
             NodeState = _nodeState,
             NodeError = _nodeError,
+            NodeCredentialSource = _nodeCredentialSource,
+            NodeCredentialStatus = _nodeCredentialStatus,
+            NodeCredentialFallbackUsed = _nodeCredentialFallbackUsed,
+            NodeCredentialBootstrapRequired = _nodeCredentialBootstrapRequired,
+            NodeCredentialDetail = _nodeCredentialDetail,
             // Clear requestId when no longer in PairingRequired to prevent stale reads
             NodePairingRequestId = _nodeState == RoleConnectionState.PairingRequired
                 ? Current.NodePairingRequestId : null,

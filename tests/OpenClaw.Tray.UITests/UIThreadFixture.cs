@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Dispatching;
@@ -32,14 +33,14 @@ namespace OpenClaw.Tray.UITests;
 public sealed class UIThreadFixture : IDisposable
 {
     // Match the Microsoft.WindowsAppSDK package's runtime major/minor. The
-    // bootstrapper resolves a system-installed Microsoft.WindowsAppRuntime.2.1
-    // framework MSIX (stable channel = empty version
-    // tag). On dev machines and on CI the runtime is installed out-of-band — see
+    // bootstrapper resolves a system-installed Microsoft.WindowsAppRuntime
+    // framework MSIX (stable channel = empty version tag). On dev machines and on
+    // CI the runtime is installed out-of-band — see
     // .github/workflows/ci.yml ("Install WindowsAppRuntime") and the README setup
     // notes. Self-contained deployment was tried but doesn't survive the xunit
     // testhost: the testhost.exe lives in the .NET SDK directory, so the SDK's
     // P/Invoke-based auto-initializer can't probe the test bin folder.
-    private const uint WinAppSdkMajorMinor = 0x00020001;
+    private static readonly uint WinAppSdkMajorMinor = ResolveWinAppSdkMajorMinor();
     private const string WinAppSdkVersionTag = "";
     private const int DefaultStartupTimeoutSeconds = 90;
 
@@ -100,8 +101,32 @@ public sealed class UIThreadFixture : IDisposable
             throw new InvalidOperationException(
                 $"UIThreadFixture failed to initialize within {timeoutSeconds}s; phase='{_startupPhase}', threadState='{threadState}'");
         }
+
         if (_startupError != null)
             throw new InvalidOperationException("UIThreadFixture initialization failed", _startupError);
+    }
+
+    private static uint ResolveWinAppSdkMajorMinor()
+    {
+        var assembly = typeof(UIThreadFixture).Assembly;
+        foreach (var attribute in assembly.GetCustomAttributes<AssemblyMetadataAttribute>())
+        {
+            if (!string.Equals(attribute.Key, "MicrosoftWindowsAppSDKVersion", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var stableVersion = attribute.Value?.Split(new[] { '-', '+' }, 2, StringSplitOptions.None)[0];
+            if (Version.TryParse(stableVersion, out var version) && version.Major >= 0 && version.Minor >= 0)
+            {
+                return ((uint)version.Major << 16) | (ushort)version.Minor;
+            }
+
+            throw new InvalidOperationException(
+                $"Assembly metadata MicrosoftWindowsAppSDKVersion '{attribute.Value}' is not a valid package version.");
+        }
+
+        throw new InvalidOperationException("Assembly metadata MicrosoftWindowsAppSDKVersion was not generated.");
     }
 
     /// <summary>Run an async lambda on the UI thread, awaiting its completion.</summary>
@@ -124,6 +149,25 @@ public sealed class UIThreadFixture : IDisposable
 
     /// <summary>Run an async void lambda on the UI thread, awaiting its completion.</summary>
     public Task RunOnUIAsync(Func<Task> work) => RunOnUIAsync(async () => { await work().ConfigureAwait(true); return 0; });
+
+    /// <summary>
+    /// Await a single LOW-priority dispatcher callback. WinUI schedules layout/render and the
+    /// realization callbacks they queue at higher priority, so by the time a Low-priority
+    /// continuation runs, all currently-queued render/layout/realization work has already run.
+    /// This is a deterministic drain primitive — a bounded alternative to sleeping a fixed
+    /// interval — used by tests that need the render queue to settle. If the dispatcher is
+    /// shutting down and rejects the enqueue, the task completes immediately so callers can
+    /// never block indefinitely.
+    /// </summary>
+    public Task YieldToRenderAsync()
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!Dispatcher.TryEnqueue(DispatcherQueuePriority.Low, () => tcs.TrySetResult()))
+        {
+            tcs.TrySetResult();
+        }
+        return tcs.Task;
+    }
 
     /// <summary>Clear the container so each test starts from an empty surface.</summary>
     public Task ResetContainerAsync() => RunOnUIAsync(() => Container.Children.Clear());
@@ -201,9 +245,9 @@ public sealed class UIThreadFixture : IDisposable
 
                     if (!IsSlow)
                     {
-                        // Default: hide the window so CI runs are silent.
-                        _startupPhase = "hiding test window";
-                        TryHide(TestWindow);
+                        // Default: keep the window live but off-screen so CI runs are silent.
+                        _startupPhase = "moving test window off-screen";
+                        MoveOffScreen(TestWindow);
                     }
 
                     _startupPhase = "ready";
@@ -223,17 +267,14 @@ public sealed class UIThreadFixture : IDisposable
         }
     }
 
-    private static void TryHide(Window w)
+    private static void MoveOffScreen(Window w)
     {
         try
         {
-            // WindowsAppSDK 1.5+ supports AppWindow.Hide via WinUIEx, but to keep
-            // deps minimal we just move the window off-screen. It's still a real
-            // Window — XamlRoot is attached, the visual tree lays out — but the
-            // user never sees it during tests.
-            var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(w);
-            // SW_HIDE = 0
-            ShowWindow(hwnd, 0);
+            // Move off-screen so CI runs are silent while keeping the window
+            // live in the WinUI compositor. XamlRoot stays attached, the visual
+            // tree lays out, but the user never sees it during tests.
+            w.AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(-32000, -32000, 1, 1));
         }
         // slopwatch-ignore: SW003 Test cleanup or fixture teardown is best-effort and must not hide the test outcome.
         catch
@@ -241,10 +282,6 @@ public sealed class UIThreadFixture : IDisposable
             // best-effort; tests still work even if the window briefly flashes.
         }
     }
-
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     public void Dispose()
     {

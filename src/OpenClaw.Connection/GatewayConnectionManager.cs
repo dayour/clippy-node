@@ -1,4 +1,9 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Net;
+using System.Net.Sockets;
 using OpenClaw.Shared;
+using OpenClaw.Shared.Telemetry;
 
 namespace OpenClaw.Connection;
 
@@ -9,6 +14,38 @@ namespace OpenClaw.Connection;
 /// </summary>
 public sealed class GatewayConnectionManager : IGatewayConnectionManager
 {
+    internal const string OperatorConnectSpanName = "openclaw.connection.operator.connect";
+    internal const string OperatorReconnectSpanName = "openclaw.connection.operator.reconnect";
+    internal const string OperatorPrepareSpanName = "openclaw.connection.operator.prepare";
+    internal const string OperatorTransportSpanName = "openclaw.connection.operator.transport";
+    internal const string OperatorHandshakeSpanName = "openclaw.connection.operator.handshake";
+    internal const string NodeConnectSpanName = "openclaw.connection.node.connect";
+    internal const string NodeReconnectSpanName = "openclaw.connection.node.reconnect";
+    internal const string NodePrepareSpanName = "openclaw.connection.node.prepare";
+    internal const string NodeTransportSpanName = "openclaw.connection.node.transport";
+    internal const string NodeHandshakeSpanName = "openclaw.connection.node.handshake";
+    internal const string AttemptsMetricName = "openclaw.connection.attempts";
+    internal const string AttemptDurationMetricName = "openclaw.connection.attempt.duration";
+    internal const string StateTransitionsMetricName = "openclaw.connection.state.transitions";
+
+    private const string RoleTag = "openclaw.connection.role";
+    private const string OperationTag = "openclaw.connection.operation";
+    private const string StateScopeTag = "openclaw.connection.state.scope";
+    private const string StateFromTag = "openclaw.connection.state.from";
+    private const string StateToTag = "openclaw.connection.state.to";
+    private static readonly Counter<long> ConnectionAttempts = OpenClawTelemetry.CreateCounter(
+        AttemptsMetricName,
+        unit: "{attempt}",
+        description: "Number of OpenClaw gateway connection attempts.");
+    private static readonly Histogram<double> ConnectionAttemptDuration = OpenClawTelemetry.CreateHistogram(
+        AttemptDurationMetricName,
+        unit: "ms",
+        description: "Duration of OpenClaw gateway connection attempts.");
+    private static readonly Counter<long> ConnectionStateTransitions = OpenClawTelemetry.CreateCounter(
+        StateTransitionsMetricName,
+        unit: "{transition}",
+        description: "Number of OpenClaw gateway connection state transitions.");
+
     private readonly ConnectionStateMachine _stateMachine = new();
     private readonly ConnectionDiagnostics _diagnostics;
     private readonly ICredentialResolver _credentialResolver;
@@ -22,15 +59,32 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
     private readonly IClock _clock;
     private readonly Func<GatewayRecord, string, bool>? _shouldStartNodeConnection;
     private readonly Func<TimeSpan, Task> _reconnectDelay;
+    private readonly Func<GatewayRecord, CancellationToken, Task<GatewayEndpointProvenance>>?
+        _endpointProvenanceProbe;
+    private readonly Func<ISshTunnelManager> _validationTunnelFactory;
+    private readonly TimeSpan _credentialHandoffTimeout;
+    private readonly TimeSpan _manualSshRestartTimeout;
+    private readonly TimeSpan _manualSshRestartCleanupTimeout;
     private readonly SemaphoreSlim _transitionSemaphore = new(1, 1);
     private readonly SemaphoreSlim _nodeStartSemaphore = new(1, 1);
     private readonly object _nodeOperationLock = new();
     private readonly object _devicePairReconnectLock = new();
     private readonly object _disposeLock = new();
+    private readonly object _telemetryLock = new();
+    private readonly object _operatorFailureLock = new();
+    private readonly object _connectionIntentLock = new();
+    private readonly HashSet<string> _userDisconnectedGatewayIds = new(StringComparer.Ordinal);
+    // Shared exclusive lease serializing destructive gateway lifecycle operations (manual WSL
+    // start/stop/restart vs auto-repair distro restart). _manualLeaseHolders counts manual holders so
+    // the monitor can additionally suppress starting new repairs while a manual action runs.
+    private readonly SemaphoreSlim _gatewayLifecycleLease = new(1, 1);
+    private int _manualLeaseHolders;
 
     private long _generation;
     private CancellationTokenSource? _operationCts;
     private long _nodeConnectionGeneration;
+    private long _nodeStartLifecycleGeneration = -1;
+    private long _nodeStartGuardVersion;
     private CancellationTokenSource? _nodeOperationCts;
     private IGatewayClientLifecycle? _activeLifecycle;
     private string? _activeIdentityPath; // identity directory for the active connection
@@ -40,6 +94,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
     private Task? _disposeTask;
     private bool _gatewayNeedsV2Signature; // remembered across reconnects
     private string? _operatorTokenRecoveryAttemptedGatewayId;
+    private string? _nodeTokenRecoveryAttemptedGatewayId;
     private string? _lastAutoApprovedDevicePairRequestId; // prevent role-upgrade auto-approve loops
     private string? _devicePairAutoApproveInFlight; // atomic guard against concurrent approval of same requestId
     private bool _devicePairReconnectInFlight;
@@ -50,6 +105,24 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
     private string? _forceBootstrapForGatewayRecordId;
     private bool _activeConnectUsedBootstrapToken;
     private bool _postBootstrapOperatorReconnectScheduled;
+    private TelemetryAttempt? _operatorTelemetryAttempt;
+    private TelemetryAttempt? _nodeTelemetryAttempt;
+    private GatewayConnectionSnapshot _lastTelemetrySnapshot = GatewayConnectionSnapshot.Idle;
+    private long _pendingOperatorFailureGeneration;
+    private GatewayErrorKind? _pendingOperatorFailureKind;
+    private long _manualSshRestartGeneration;
+    private CancellationTokenSource? _manualSshRestartCts;
+
+    private const string MissingNodeCredentialMessage =
+        "No node credential available. Re-pair this PC or add a shared/bootstrap gateway token.";
+    private const string MissingNodeConnectorMessage =
+        "Node mode is enabled, but no node connector is configured.";
+    private const string MissingActiveGatewayForNodeMessage =
+        "Node mode is enabled, but there is no active gateway context for node startup.";
+    private const string MissingGatewayRecordForNodeMessage =
+        "Node mode is enabled, but the active gateway record could not be found.";
+    private const string NodeTunnelStartFailedMessage =
+        "Node mode is enabled, but the SSH tunnel for node startup could not be started.";
 
     public event EventHandler<GatewayConnectionSnapshot>? StateChanged;
     public event EventHandler<ConnectionDiagnosticEvent>? DiagnosticEvent;
@@ -67,7 +140,13 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         ConnectionDiagnostics? diagnostics = null,
         ISshTunnelManager? tunnelManager = null,
         Func<GatewayRecord, string, bool>? shouldStartNodeConnection = null,
-        Func<TimeSpan, Task>? reconnectDelay = null)
+        Func<TimeSpan, Task>? reconnectDelay = null,
+        Func<GatewayRecord, CancellationToken, Task<GatewayEndpointProvenance>>?
+            endpointProvenanceProbe = null,
+        Func<ISshTunnelManager>? validationTunnelFactory = null,
+        TimeSpan? credentialHandoffTimeout = null,
+        TimeSpan? manualSshRestartTimeout = null,
+        TimeSpan? manualSshRestartCleanupTimeout = null)
     {
         _credentialResolver = credentialResolver ?? throw new ArgumentNullException(nameof(credentialResolver));
         _clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
@@ -80,6 +159,18 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         _clock = clock ?? SystemClock.Instance;
         _shouldStartNodeConnection = shouldStartNodeConnection;
         _reconnectDelay = reconnectDelay ?? Task.Delay;
+        _endpointProvenanceProbe = endpointProvenanceProbe;
+        _validationTunnelFactory = validationTunnelFactory ?? (() => new SshTunnelService(_logger));
+        _credentialHandoffTimeout = credentialHandoffTimeout ?? TimeSpan.FromSeconds(5);
+        _manualSshRestartTimeout = manualSshRestartTimeout ?? TimeSpan.FromSeconds(35);
+        _manualSshRestartCleanupTimeout =
+            manualSshRestartCleanupTimeout ?? TimeSpan.FromSeconds(5);
+        if (_credentialHandoffTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(credentialHandoffTimeout));
+        if (_manualSshRestartTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(manualSshRestartTimeout));
+        if (_manualSshRestartCleanupTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(manualSshRestartCleanupTimeout));
         _diagnostics = diagnostics ?? new ConnectionDiagnostics(clock: clock);
         _diagnostics.EventRecorded += (_, e) => DiagnosticEvent?.Invoke(this, e);
 
@@ -88,6 +179,11 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             _nodeConnector.StatusChanged += OnNodeStatusChanged;
             _nodeConnector.PairingStatusChanged += OnNodePairingStatusChanged;
             _nodeConnector.DeviceTokenReceived += OnNodeDeviceTokenReceived;
+            if (_nodeConnector is INodeConnectorTelemetryEvents telemetryEvents)
+            {
+                telemetryEvents.TransportConnected += OnNodeTransportConnected;
+                telemetryEvents.ConnectionFailure += OnNodeConnectionFailure;
+            }
         }
     }
 
@@ -108,7 +204,10 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         await _transitionSemaphore.WaitAsync();
         try
         {
-            await ConnectCoreAsync(gatewayId);
+            var targetId = gatewayId ?? _registry.ActiveGatewayId;
+            if (targetId is not null)
+                SetGatewayConnectionIntent(targetId, shouldBeConnected: true);
+            await ConnectCoreAsync(gatewayId, "connect");
         }
         finally
         {
@@ -119,7 +218,6 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
     public async Task ConnectNodeOnlyAsync(string? gatewayId = null)
     {
         ThrowIfDisposed();
-        var prevState = _stateMachine.Current.OverallState;
         long? preparedGeneration = null;
 
         await _transitionSemaphore.WaitAsync();
@@ -137,11 +235,50 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
         var startedGeneration = await StartNodeConnectionAsync(preparedGeneration.Value);
         if (startedGeneration.HasValue)
-            EmitStateChanged(prevState);
+        {
+            EmitStateChanged();
+        }
+        else
+        {
+            if (Interlocked.Read(ref _generation) != preparedGeneration.Value ||
+                _tunnelManager?.IsActive != true)
+            {
+                return;
+            }
+
+            var enteredTransition = await _transitionSemaphore
+                .WaitAsync(TimeSpan.FromSeconds(1))
+                .ConfigureAwait(false);
+            if (!enteredTransition)
+            {
+                _logger.Warn("[ConnMgr] Timed out waiting to clean up failed node-only tunnel");
+                _diagnostics.Record(
+                    "tunnel",
+                    "Timed out waiting to clean up failed node-only tunnel");
+                return;
+            }
+
+            try
+            {
+                if (Interlocked.Read(ref _generation) == preparedGeneration.Value &&
+                    _activeLifecycle == null &&
+                    _tunnelManager?.IsActive == true)
+                {
+                    await StopTunnelAfterFailedConnectionAsync("node-only connection failure");
+                }
+            }
+            finally
+            {
+                _transitionSemaphore.Release();
+            }
+        }
     }
 
     /// <summary>Core connect logic. Caller must hold <see cref="_transitionSemaphore"/>.</summary>
-    private async Task ConnectCoreAsync(string? gatewayId = null)
+    private async Task ConnectCoreAsync(
+        string? gatewayId = null,
+        string operation = "connect",
+        CancellationToken externalCancellationToken = default)
     {
             var id = gatewayId ?? _registry.ActiveGatewayId;
             if (id == null)
@@ -165,12 +302,16 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
             // Cancel any in-flight operation
             var gen = Interlocked.Increment(ref _generation);
-            var oldCts = Interlocked.Exchange(ref _operationCts, new CancellationTokenSource());
+            var newOperationCts = externalCancellationToken.CanBeCanceled
+                ? CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken)
+                : new CancellationTokenSource();
+            var oldCts = Interlocked.Exchange(ref _operationCts, newOperationCts);
             oldCts?.Cancel();
             oldCts?.Dispose();
 
             // Dispose old client
             await DisposeActiveClientAsync();
+            StartOperatorTelemetryAttempt(operation, gen);
 
             // Update snapshot with gateway info
             _stateMachine.Current = _stateMachine.Current with
@@ -185,45 +326,116 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             if (!Directory.Exists(perGatewayIdentityDir))
                 Directory.CreateDirectory(perGatewayIdentityDir);
 
-            var credential = _credentialResolver.ResolveOperator(record, perGatewayIdentityDir);
+            var credentialResolution = _credentialResolver.ResolveOperatorDetailed(record, perGatewayIdentityDir);
+            var credential = credentialResolution.Credential;
+            if (HasPersistedIdentityFailure(credentialResolution))
+            {
+                _diagnostics.RecordCredentialResolutionResult(credentialResolution);
+                _diagnostics.Record(
+                    "identity",
+                    "Stored device identity could not be loaded for operator connection",
+                    credentialResolution.Detail);
+                _stateMachine.TryTransition(ConnectionTrigger.ConnectRequested);
+                _stateMachine.SetOperatorCredentialResolution(credentialResolution);
+                _stateMachine.TryTransition(
+                    ConnectionTrigger.WebSocketError,
+                    DeviceIdentityLoadException.RecoveryMessage);
+                CompleteOperatorTelemetryAttempt(
+                    gen,
+                    "failure",
+                    ConnectionErrorCategory.InternalError);
+                EmitStateChanged();
+                return;
+            }
+
             if (_forceBootstrapForGatewayRecordId == record.Id &&
                 !string.IsNullOrWhiteSpace(record.BootstrapToken))
             {
                 credential = new GatewayCredential(
                     record.BootstrapToken!,
                     IsBootstrapToken: true,
-                    CredentialResolver.SourceBootstrapToken);
+                    CredentialResolver.SourceBootstrapToken)
+                {
+                    ResolutionStatus = GatewayCredentialResolutionStatus.BootstrapRequired,
+                    ResolutionDetail = "Using setup-code bootstrap token for this connection."
+                };
+                credentialResolution = new GatewayCredentialResolution(
+                    credential,
+                    GatewayCredentialResolutionStatus.BootstrapRequired,
+                    BootstrapRequired: true,
+                    Detail: credential.ResolutionDetail);
                 _forceBootstrapForGatewayRecordId = null;
             }
             _activeConnectUsedBootstrapToken = credential?.IsBootstrapToken == true;
             _postBootstrapOperatorReconnectScheduled = false;
-            _diagnostics.RecordCredentialResolution(credential);
+            _diagnostics.RecordCredentialResolutionResult(credentialResolution);
             _activeIdentityPath = perGatewayIdentityDir;
             _activeGatewayRecordId = record.Id;
             _activeSshTunnel = record.SshTunnel;
             _gatewayNeedsV2Signature = record.IsLocal || record.RequiresV2Signature;
+            SyncNodeIntentFromSettings();
 
             if (credential == null)
             {
                 _logger.Warn("[ConnMgr] No credential available for gateway");
-                var prev = _stateMachine.Current.OverallState;
                 // Must go through Connecting → Error since AuthenticationFailed requires Connecting state
                 _stateMachine.TryTransition(ConnectionTrigger.ConnectRequested);
-                _stateMachine.TryTransition(ConnectionTrigger.AuthenticationFailed, "No credential available");
-                EmitStateChanged(prev);
+                _stateMachine.SetOperatorCredentialResolution(credentialResolution);
+                _stateMachine.TryTransition(
+                    ConnectionTrigger.AuthenticationFailed,
+                    BuildCredentialFailureMessage("operator", credentialResolution));
+                CompleteOperatorTelemetryAttempt(
+                    gen,
+                    "failure",
+                    ConnectionErrorCategory.AuthFailure);
+                EmitStateChanged();
+                return;
+            }
+
+            var endpointAuthorization = await AuthorizeCredentialForEndpointAsync(
+                    record,
+                    credential,
+                    _operationCts!.Token).ConfigureAwait(false);
+            var expectedEndpointOwnership = endpointAuthorization.OwnershipProof;
+            if (_disposed ||
+                Interlocked.Read(ref _generation) != gen ||
+                _operationCts?.IsCancellationRequested != false)
+            {
+                return;
+            }
+            if (!endpointAuthorization.Allowed)
+            {
+                _stateMachine.TryTransition(ConnectionTrigger.ConnectRequested);
+                _stateMachine.SetOperatorCredentialResolution(credentialResolution);
+                _stateMachine.SetOperatorErrorKind(endpointAuthorization.FailureKind);
+                _stateMachine.TryTransition(
+                    endpointAuthorization.FailureKind == GatewayErrorKind.Network
+                        ? ConnectionTrigger.WebSocketError
+                        : ConnectionTrigger.AuthenticationFailed,
+                    endpointAuthorization.Detail);
+                _diagnostics.Record("setup", "Blocked strong credential before managed-local endpoint ownership was proven", endpointAuthorization.Detail);
+                CompleteOperatorTelemetryAttempt(
+                    gen,
+                    "failure",
+                    endpointAuthorization.FailureKind == GatewayErrorKind.Network
+                        ? ConnectionErrorCategory.NetworkUnreachable
+                        : ConnectionErrorCategory.AuthFailure);
+                EmitStateChanged();
                 return;
             }
 
             // Transition to Connecting
             var prevState = _stateMachine.Current.OverallState;
             _stateMachine.TryTransition(ConnectionTrigger.ConnectRequested);
+            _stateMachine.SetOperatorCredentialResolution(credentialResolution);
             _diagnostics.RecordStateChange(prevState, _stateMachine.Current.OverallState);
-            EmitStateChanged(prevState);
+            EmitStateChanged();
 
             // Create client via factory — use a diagnostic-tee logger so client handshake
             // logs appear in the Connection Status window timeline.
             // When SSH tunnel is configured, start the tunnel and connect to the local URL.
             var connectUrl = record.Url;
+            SshTunnelStartResult? startedTunnel = null;
             if (record.SshTunnel != null && _tunnelManager != null)
             {
                 var tunnel = record.SshTunnel;
@@ -233,33 +445,142 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 {
                     _logger.Warn("[ConnMgr] SSH tunnel config is incomplete");
                     _diagnostics.Record("tunnel", "SSH tunnel config is incomplete");
-                    var p = _stateMachine.Current.OverallState;
                     _stateMachine.TryTransition(ConnectionTrigger.AuthenticationFailed, "SSH tunnel config is incomplete");
-                    EmitStateChanged(p);
+                    CompleteOperatorTelemetryAttempt(
+                        gen,
+                        "failure",
+                        ConnectionErrorCategory.SshTunnelFailure);
+                    EmitStateChanged();
                     return;
                 }
                 try
                 {
-                    connectUrl = await _tunnelManager.StartAsync(tunnel, _operationCts!.Token);
+                    startedTunnel = await _tunnelManager
+                        .StartOwnedAsync(tunnel, _operationCts!.Token)
+                        .ConfigureAwait(false);
+                    connectUrl = startedTunnel.Url;
+                    var tunnelAuthorization = await AuthorizeCredentialForEndpointAsync(
+                        record,
+                        credential,
+                        _operationCts.Token,
+                        requireSshTunnelOwnership: true).ConfigureAwait(false);
+                    if (!tunnelAuthorization.Allowed)
+                    {
+                        _stateMachine.SetOperatorErrorKind(tunnelAuthorization.FailureKind);
+                        _stateMachine.TryTransition(
+                            tunnelAuthorization.FailureKind == GatewayErrorKind.Network
+                                ? ConnectionTrigger.WebSocketError
+                                : ConnectionTrigger.AuthenticationFailed,
+                            tunnelAuthorization.Detail);
+                        await StopOwnedTunnelAfterFailedConnectionAsync(
+                            startedTunnel,
+                            "SSH tunnel ownership authorization failure");
+                        CompleteOperatorTelemetryAttempt(
+                            gen,
+                            "failure",
+                            ConnectionErrorCategory.SshTunnelFailure);
+                        EmitStateChanged();
+                        return;
+                    }
+                    expectedEndpointOwnership = tunnelAuthorization.OwnershipProof;
                     _diagnostics.Record("tunnel", $"SSH tunnel started → {connectUrl}");
                 }
                 catch (Exception ex)
                 {
                     _logger.Error($"[ConnMgr] SSH tunnel start failed: {ex.Message}");
                     _diagnostics.Record("tunnel", "SSH tunnel start failed", ex.Message);
-                    var p = _stateMachine.Current.OverallState;
                     _stateMachine.TryTransition(ConnectionTrigger.WebSocketError, $"SSH tunnel failed: {ex.Message}");
-                    EmitStateChanged(p);
+                    if (startedTunnel is not null)
+                    {
+                        await StopOwnedTunnelAfterFailedConnectionAsync(
+                            startedTunnel,
+                            "SSH tunnel startup or authorization failure");
+                    }
+                    CompleteOperatorTelemetryAttempt(
+                        gen,
+                        "failure",
+                        ConnectionErrorCategory.SshTunnelFailure);
+                    EmitStateChanged();
                     return;
                 }
             }
             else if (record.SshTunnel != null)
             {
-                // Tunnel config present but no tunnel manager — use local URL directly
-                connectUrl = $"ws://localhost:{record.SshTunnel.LocalPort}";
+                const string detail =
+                    "SSH tunnel manager is unavailable, so credentials were not sent.";
+                _diagnostics.Record("tunnel", detail);
+                _stateMachine.SetOperatorErrorKind(GatewayErrorKind.Network);
+                _stateMachine.TryTransition(ConnectionTrigger.AuthenticationFailed, detail);
+                CompleteOperatorTelemetryAttempt(
+                    gen,
+                    "failure",
+                    ConnectionErrorCategory.SshTunnelFailure);
+                EmitStateChanged();
+                return;
             }
             var diagLogger = new DiagnosticTeeLogger(_logger, _diagnostics);
-            var lifecycle = _clientFactory.Create(connectUrl, credential, perGatewayIdentityDir, diagLogger);
+            IGatewayClientLifecycle lifecycle;
+            try
+            {
+                lifecycle = _clientFactory.Create(connectUrl, credential, perGatewayIdentityDir, diagLogger);
+            }
+            catch (DeviceIdentityLoadException ex)
+            {
+                var detail = BuildIdentityFailureDetail(ex);
+                _logger.Error($"[ConnMgr] Stored device identity load failed: {detail}");
+                _diagnostics.Record(
+                    "identity",
+                    "Stored device identity could not be loaded",
+                    detail);
+                _stateMachine.TryTransition(
+                    ConnectionTrigger.WebSocketError,
+                    DeviceIdentityLoadException.RecoveryMessage);
+                if (startedTunnel is not null)
+                {
+                    await StopOwnedTunnelAfterFailedConnectionAsync(
+                        startedTunnel,
+                        "operator identity load failure");
+                }
+                CompleteOperatorTelemetryAttempt(
+                    gen,
+                    "failure",
+                    ConnectionErrorCategory.InternalError);
+                EmitStateChanged();
+                return;
+            }
+
+            var operatorOperationCancellation = _operationCts!.Token;
+            async Task<ReconnectAuthorizationResult> AuthorizeLiveCredentialHandoffAsync(
+                CancellationToken cancellationToken)
+            {
+                var authorization = await AuthorizeCredentialHandoffAsync(
+                        record,
+                        credential,
+                        expectedEndpointOwnership,
+                        () => IsCurrentGatewayAttempt(gen, record.Id) &&
+                            IsAutomaticReconnectAllowed(record.Id),
+                        operatorOperationCancellation,
+                        cancellationToken,
+                        "operator")
+                    .ConfigureAwait(false);
+                if (!authorization.Allowed &&
+                    authorization.FailureKind != GatewayErrorKind.Unknown)
+                {
+                    await RecordOperatorCredentialHandoffFailureAsync(
+                            authorization.Detail ?? "Operator credential handoff was not authorized.",
+                            authorization.FailureKind,
+                            operatorOperationCancellation,
+                            gen,
+                            record.Id)
+                        .ConfigureAwait(false);
+                }
+                return authorization;
+            }
+
+            lifecycle.DataClient.HandshakeAuthorizationAsync =
+                AuthorizeLiveCredentialHandoffAsync;
+            lifecycle.DataClient.ReconnectAuthorizationAsync =
+                AuthorizeLiveCredentialHandoffAsync;
             _activeLifecycle = lifecycle;
             OperatorClientChanged?.Invoke(this, new OperatorClientChangedEventArgs
             {
@@ -267,41 +588,50 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 NewClient = lifecycle.DataClient
             });
 
-            // Subscribe to client events with generation guard
+            // Subscribe to client events with generation and gateway guards.
+            var subscribedGatewayId = record.Id;
             lifecycle.StatusChanged += (s, status) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
                 _ = HandleOperatorStatusChangedAsync(status, gen);
             };
             lifecycle.AuthenticationFailed += (s, msg) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
                 _ = HandleAuthenticationFailedAsync(msg, gen);
+            };
+            lifecycle.DataClient.ConnectionFailure += (s, kind) =>
+            {
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
+                RecordOperatorFailureKind(gen, kind);
+            };
+            lifecycle.DataClient.TransportConnected += (s, e) =>
+            {
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
+                TransitionOperatorTelemetryPhase(gen, OperatorHandshakeSpanName);
             };
             lifecycle.DataClient.HandshakeSucceeded += (s, e) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
                 _ = HandleHandshakeSucceededAsync(gen);
             };
             lifecycle.DataClient.DeviceTokenReceived += (s, e) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
-                HandleDeviceTokenReceived(e);
+                _ = HandleDeviceTokenReceivedAsync(e, gen, subscribedGatewayId, perGatewayIdentityDir);
             };
             lifecycle.DataClient.PairingRequired += (s, requestId) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
                 _ = HandlePairingRequiredAsync(requestId, gen);
             };
             lifecycle.DataClient.NodePairListUpdated += (s, list) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
+                if (!IsCurrentGatewayAttempt(gen, subscribedGatewayId)) return;
                 _ = HandleNodePairListUpdatedAsync(list, gen);
             };
-            lifecycle.DataClient.V2SignatureFallback += (s, _) =>
+            lifecycle.DataClient.V2SignatureFallback += (s, e) =>
             {
-                if (Interlocked.Read(ref _generation) != gen) return;
-                RememberGatewayNeedsV2Signature(record.Id);
+                _ = HandleV2SignatureFallbackAsync(gen, subscribedGatewayId);
             };
 
             // Local gateways only support v2 signatures — skip the v3 attempt entirely
@@ -315,6 +645,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
             // Connect (fire and forget — the event handlers will drive state transitions)
             var ct = _operationCts!.Token;
+            TransitionOperatorTelemetryPhase(gen, OperatorTransportSpanName);
             _ = Task.Run(async () =>
             {
                 try
@@ -325,6 +656,10 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 catch (Exception ex)
                 {
                     _logger.Error($"[ConnMgr] Connect failed: {ex.Message}");
+                    CompleteOperatorTelemetryAttempt(
+                        gen,
+                        "failure",
+                        ConnectionErrorCategory.InternalError);
                 }
             }, ct);
     }
@@ -353,14 +688,6 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         var perGatewayIdentityDir = _registry.GetIdentityDirectory(record.Id);
         if (!Directory.Exists(perGatewayIdentityDir))
             Directory.CreateDirectory(perGatewayIdentityDir);
-
-        var nodeCredential = _credentialResolver.ResolveNode(record, perGatewayIdentityDir);
-        if (nodeCredential == null)
-        {
-            _logger.Warn("[ConnMgr] No node credential available for node-only connect");
-            _diagnostics.Record("node", "No node credential available for node-only connect");
-            return null;
-        }
 
         // Same-gateway node reapproval reconnects keep the operator alive so it can
         // request the post-handshake node.list; all other paths reset lifecycle/tunnel state.
@@ -391,26 +718,119 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             GatewayUrl = record.Url,
             GatewayName = record.FriendlyName
         };
+        _stateMachine.SetNodeEnabled(true);
+        _stateMachine.StartNodeConnecting();
+        _stateMachine.SetNodeCredentialSource(null);
 
-        _diagnostics.RecordCredentialResolution(nodeCredential);
+        var nodeCredentialResolution = _credentialResolver.ResolveNodeDetailed(record, perGatewayIdentityDir);
+        var nodeCredential = nodeCredentialResolution.Credential;
+        if (HasPersistedIdentityFailure(nodeCredentialResolution))
+        {
+            _diagnostics.RecordCredentialResolutionResult(nodeCredentialResolution);
+            _diagnostics.Record(
+                "identity",
+                "Stored device identity could not be loaded for node-only connection",
+                nodeCredentialResolution.Detail);
+            _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+            _stateMachine.BlockNodeStart(
+                DeviceIdentityLoadException.RecoveryMessage,
+                preserveCredentialResolution: true);
+            EmitStateChanged();
+            RecordNodePreflightTelemetryFailure(ConnectionErrorCategory.InternalError);
+            return null;
+        }
+        if (nodeCredential == null)
+        {
+            _logger.Warn("[ConnMgr] No node credential available for node-only connect");
+            _diagnostics.RecordCredentialResolutionResult(nodeCredentialResolution);
+            _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+            _stateMachine.BlockNodeStart(
+                BuildCredentialFailureMessage("node", nodeCredentialResolution),
+                preserveCredentialResolution: true);
+            EmitStateChanged();
+            RecordNodePreflightTelemetryFailure(ConnectionErrorCategory.AuthFailure);
+            return null;
+        }
+
+        var nodeEndpointAuthorization = await AuthorizeCredentialForEndpointAsync(
+                record,
+                nodeCredential,
+                _operationCts?.Token ?? CancellationToken.None).ConfigureAwait(false);
+        if (_disposed ||
+            Interlocked.Read(ref _generation) != gen ||
+            _operationCts?.IsCancellationRequested != false)
+        {
+            return null;
+        }
+        if (!nodeEndpointAuthorization.Allowed)
+        {
+            _diagnostics.Record("setup", "Blocked node credential before managed-local endpoint ownership was proven", nodeEndpointAuthorization.Detail);
+            _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+            _stateMachine.BlockNodeStart(nodeEndpointAuthorization.Detail, preserveCredentialResolution: true);
+            EmitStateChanged();
+            RecordNodePreflightTelemetryFailure(ConnectionErrorCategory.AuthFailure);
+            return null;
+        }
+
+        _diagnostics.RecordCredentialResolutionResult(nodeCredentialResolution);
+        if (!preservesOperatorConnection)
+            _stateMachine.SetOperatorCredentialSource(null);
         _diagnostics.Record("node", $"Starting node-only connection to {record.Url}",
             $"Credential source: {nodeCredential.Source}");
 
-        if (!preservesOperatorConnection && !await TryStartTunnelForNodeOnlyAsync(record))
-            return null;
+        SshTunnelStartResult? startedTunnel = null;
+        if (!preservesOperatorConnection && record.SshTunnel is not null)
+        {
+            startedTunnel = await TryStartTunnelForNodeOnlyAsync(record);
+            if (startedTunnel is null)
+            {
+                _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+                _stateMachine.BlockNodeStart(NodeTunnelStartFailedMessage, preserveCredentialResolution: true);
+                EmitStateChanged();
+                RecordNodePreflightTelemetryFailure(ConnectionErrorCategory.SshTunnelFailure);
+                return null;
+            }
+        }
+
+        if (record.SshTunnel is not null)
+        {
+            var tunnelAuthorization = await AuthorizeCredentialForEndpointAsync(
+                record,
+                nodeCredential,
+                _operationCts?.Token ?? CancellationToken.None,
+                requireSshTunnelOwnership: true).ConfigureAwait(false);
+            if (!tunnelAuthorization.Allowed)
+            {
+                if (!preservesOperatorConnection)
+                {
+                    await StopOwnedTunnelAfterFailedConnectionAsync(
+                        startedTunnel!,
+                        "node-only ownership proof failure");
+                }
+
+                _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+                _stateMachine.BlockNodeStart(
+                    tunnelAuthorization.Detail,
+                    preserveCredentialResolution: true);
+                EmitStateChanged();
+                RecordNodePreflightTelemetryFailure(ConnectionErrorCategory.AuthFailure);
+                return null;
+            }
+        }
 
         return Interlocked.Read(ref _generation) == gen ? gen : null;
     }
 
-    private async Task<bool> TryStartTunnelForNodeOnlyAsync(GatewayRecord record)
+    private async Task<SshTunnelStartResult?> TryStartTunnelForNodeOnlyAsync(
+        GatewayRecord record)
     {
         if (record.SshTunnel == null)
-            return true;
+            return null;
 
         if (_tunnelManager == null)
         {
-            _diagnostics.Record("tunnel", "No tunnel manager available; using configured local tunnel URL for node-only connect");
-            return true;
+            _diagnostics.Record("tunnel", "No tunnel manager available for node-only SSH connection");
+            return null;
         }
 
         var tunnel = record.SshTunnel;
@@ -421,20 +841,76 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         {
             _logger.Warn("[ConnMgr] SSH tunnel config is incomplete for node-only connect");
             _diagnostics.Record("tunnel", "SSH tunnel config is incomplete for node-only connect");
-            return false;
+            return null;
         }
 
         try
         {
-            var connectUrl = await _tunnelManager.StartAsync(tunnel, _operationCts!.Token);
-            _diagnostics.Record("tunnel", $"SSH tunnel started for node-only connect → {connectUrl}");
-            return true;
+            var startedTunnel = await _tunnelManager
+                .StartOwnedAsync(tunnel, _operationCts!.Token)
+                .ConfigureAwait(false);
+            _diagnostics.Record(
+                "tunnel",
+                $"SSH tunnel started for node-only connect → {startedTunnel.Url}");
+            return startedTunnel;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.Error($"[ConnMgr] SSH tunnel start failed for node-only connect: {ex.Message}");
             _diagnostics.Record("tunnel", "SSH tunnel start failed for node-only connect", ex.Message);
-            return false;
+            return null;
+        }
+    }
+
+    private async Task StopOwnedTunnelAfterFailedConnectionAsync(
+        SshTunnelStartResult startedTunnel,
+        string operation)
+    {
+        if (_tunnelManager is null)
+            return;
+
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            if (await _tunnelManager.StopIfOwnedAsync(
+                    startedTunnel.Config,
+                    startedTunnel.OwnershipGeneration,
+                    stopCts.Token).ConfigureAwait(false))
+            {
+                _diagnostics.Record("tunnel", $"SSH tunnel stopped after {operation}");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.Warn($"[ConnMgr] Tunnel stop timed out after {operation}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[ConnMgr] Tunnel stop failed after {operation}: {ex.Message}");
+        }
+    }
+
+    private async Task StopTunnelAfterFailedConnectionAsync(string operation)
+    {
+        if (_tunnelManager?.IsActive != true)
+            return;
+
+        try
+        {
+            var stopTask = _tunnelManager.StopAsync();
+            if (await Task.WhenAny(stopTask, Task.Delay(TimeSpan.FromSeconds(5))) != stopTask)
+            {
+                _logger.Warn($"[ConnMgr] Tunnel stop timed out after {operation}");
+                return;
+            }
+
+            await stopTask;
+            _diagnostics.Record("tunnel", $"SSH tunnel stopped after {operation}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[ConnMgr] Tunnel stop failed after {operation}: {ex.Message}");
+            _diagnostics.Record("tunnel", $"SSH tunnel stop failed after {operation}", ex.Message);
         }
     }
 
@@ -452,19 +928,39 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         }
     }
 
+    public async Task DisconnectByUserAsync()
+    {
+        ThrowIfDisposed();
+        await _transitionSemaphore.WaitAsync();
+        try
+        {
+            var gatewayId = _registry.ActiveGatewayId;
+            if (gatewayId is not null)
+                SetGatewayConnectionIntent(gatewayId, shouldBeConnected: false);
+            await DisconnectCoreAsync();
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
     /// <summary>Core disconnect logic. Caller must hold <see cref="_transitionSemaphore"/>.</summary>
     private async Task DisconnectCoreAsync()
     {
+        CancelOperatorTelemetryAttempt("canceled", ConnectionErrorCategory.Cancelled);
         Interlocked.Increment(ref _generation);
+        CancelNodeTelemetryAttempt("canceled", ConnectionErrorCategory.Cancelled);
         var oldCts = Interlocked.Exchange(ref _operationCts, null);
         oldCts?.Cancel();
         oldCts?.Dispose();
 
         var prev = _stateMachine.Current.OverallState;
         await DisposeActiveClientAsync();
+        SyncNodeIntentFromSettings();
         _stateMachine.TryTransition(ConnectionTrigger.DisconnectRequested);
         _diagnostics.RecordStateChange(prev, _stateMachine.Current.OverallState);
-        EmitStateChanged(prev);
+        EmitStateChanged();
     }
 
     public async Task ReconnectAsync()
@@ -473,8 +969,11 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         await _transitionSemaphore.WaitAsync();
         try
         {
+            var gatewayId = _registry.ActiveGatewayId;
+            if (gatewayId is not null)
+                SetGatewayConnectionIntent(gatewayId, shouldBeConnected: true);
             await DisconnectCoreAsync();
-            await ConnectCoreAsync();
+            await ConnectCoreAsync(operation: "reconnect");
         }
         finally
         {
@@ -482,12 +981,468 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         }
     }
 
-    public async Task SwitchGatewayAsync(string gatewayId)
+    /// <summary>
+    /// Reconnects the active gateway ONLY if <paramref name="gatewayId"/> is still the active
+    /// gateway, and honors cancellation. Used by managed-local auto-repair so a gateway switch
+    /// during a repair cannot disrupt the newly selected gateway, and so a shutdown-cancelled
+    /// repair does not drive a reconnect into a disposing manager. Returns true if it reconnected,
+    /// false if the active gateway changed (no-op).
+    /// </summary>
+    public async Task<bool> ReconnectIfCurrentAsync(string gatewayId, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        await _transitionSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (!IsAutomaticReconnectAllowed(gatewayId))
+                return false;
+
+            if (!string.Equals(_registry.ActiveGatewayId, gatewayId, StringComparison.Ordinal))
+                return false;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            await DisconnectCoreAsync();
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Re-validate under the same semaphore hold before connecting: an out-of-band SetActive
+            // (e.g. a UI gateway switch that mutates the registry outside this manager) could have
+            // changed the active gateway while we were disconnecting. Fail closed if so.
+            if (!string.Equals(_registry.ActiveGatewayId, gatewayId, StringComparison.Ordinal))
+                return false;
+            if (!IsAutomaticReconnectAllowed(gatewayId))
+                return false;
+
+            // Connect the PINNED gateway id, not "whatever is active now" — ConnectCoreAsync otherwise
+            // re-reads ActiveGatewayId, which the UI can mutate outside this semaphore, so an
+            // unpinned connect could bring up a different gateway than the one this repair targeted.
+            await ConnectCoreAsync(gatewayId, operation: "reconnect");
+
+            // Report whether a connection was actually LAUNCHED for the pinned gateway. ConnectCoreAsync
+            // bails to the Error state (without creating a client) when the record was removed mid-flight
+            // or credential resolution failed — returning true there would let auto-repair treat a
+            // credential failure as "reconnected, just unverified" and restart WSL, which cannot fix
+            // credentials. Require a non-Error operator state AND the pinned record still active.
+            return _stateMachine.Current.OperatorState is not RoleConnectionState.Error
+                && _registry.GetById(gatewayId) is not null
+                && string.Equals(_registry.ActiveGatewayId, gatewayId, StringComparison.Ordinal);
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
+    public async Task<bool> RecoverSshTunnelAsync(SshTunnelExit tunnelExit)
     {
         ThrowIfDisposed();
         await _transitionSemaphore.WaitAsync();
         try
         {
+            var activeGateway = _registry.GetActive();
+            if (tunnelExit.Owner != SshTunnelOwner.GatewayConnectionManager ||
+                activeGateway?.SshTunnel != tunnelExit.Tunnel ||
+                !IsAutomaticReconnectAllowed(activeGateway.Id) ||
+                _tunnelManager?.IsRestartPending(tunnelExit) != true)
+            {
+                return false;
+            }
+
+            // DisconnectCoreAsync retires the gateway clients but deliberately leaves the
+            // tunnel alone. Keep its generation token valid until ConnectCoreAsync replaces
+            // the failed process, while preventing a delayed callback from reviving an old gateway.
+            await DisconnectCoreAsync();
+
+            var currentGateway = _registry.GetActive();
+            if (currentGateway?.Id != activeGateway.Id ||
+                currentGateway.SshTunnel != tunnelExit.Tunnel ||
+                !IsAutomaticReconnectAllowed(activeGateway.Id) ||
+                _tunnelManager?.IsRestartPending(tunnelExit) != true)
+            {
+                return false;
+            }
+
+            await ConnectCoreAsync(activeGateway.Id, "reconnect");
+            return _stateMachine.Current.OperatorState is not RoleConnectionState.Error
+                && _registry.GetById(activeGateway.Id) is not null
+                && _tunnelManager?.IsActive == true
+                && string.Equals(_registry.ActiveGatewayId, activeGateway.Id, StringComparison.Ordinal);
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
+    public async Task<bool> RestartSshTunnelAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        var restartGeneration = Interlocked.Increment(ref _manualSshRestartGeneration);
+        using var restartCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        restartCts.CancelAfter(_manualSshRestartTimeout);
+        var previousRestartCts = Interlocked.Exchange(ref _manualSshRestartCts, restartCts);
+        try { previousRestartCts?.Cancel(); }
+        catch (ObjectDisposedException) { }
+
+        EventHandler<GatewayConnectionSnapshot>? stateHandler = null;
+        TaskCompletionSource<bool>? handshakeCompletion = null;
+        long connectionGeneration = 0;
+        long tunnelGeneration = 0;
+        IGatewayClientLifecycle? lifecycle = null;
+        GatewayRecord? expectedGatewayRecord = null;
+        string? gatewayId = null;
+        SshTunnelConfig? tunnelConfig = null;
+        SshTunnelConfig? ownedTunnelConfig = null;
+        var succeeded = false;
+
+        try
+        {
+            await _transitionSemaphore.WaitAsync(restartCts.Token).ConfigureAwait(false);
+            try
+            {
+                if (restartGeneration != Interlocked.Read(ref _manualSshRestartGeneration))
+                    return false;
+
+                var activeRecord = _registry.GetActive();
+                expectedGatewayRecord = activeRecord;
+                gatewayId = activeRecord?.Id;
+                tunnelConfig = activeRecord?.SshTunnel;
+                if (activeRecord is null ||
+                    tunnelConfig is null ||
+                    _tunnelManager is null)
+                {
+                    return false;
+                }
+                ownedTunnelConfig = tunnelConfig with
+                {
+                    User = tunnelConfig.User.Trim(),
+                    Host = tunnelConfig.Host.Trim(),
+                };
+
+                var previousTunnelGeneration = _tunnelManager.OwnershipGeneration;
+                var previousTunnelWasActive = _tunnelManager.IsActive;
+                var previousTunnelConfig = _tunnelManager.ActiveConfig;
+                if (previousTunnelWasActive && previousTunnelConfig is null)
+                    return false;
+
+                if (previousTunnelWasActive)
+                {
+                    var stopped = await _tunnelManager.StopIfOwnedAsync(
+                            previousTunnelConfig!,
+                            previousTunnelGeneration,
+                            restartCts.Token)
+                        .ConfigureAwait(false);
+                    if (!stopped)
+                        return false;
+                }
+                else if (_tunnelManager.IsActive)
+                {
+                    return false;
+                }
+
+                var stoppedTunnelGeneration = _tunnelManager.OwnershipGeneration;
+                SetGatewayConnectionIntent(activeRecord.Id, shouldBeConnected: true);
+                await DisconnectCoreAsync().ConfigureAwait(false);
+                if (restartGeneration != Interlocked.Read(ref _manualSshRestartGeneration) ||
+                    !IsCurrentSshRegistryRecord(activeRecord) ||
+                    _tunnelManager.OwnershipGeneration != stoppedTunnelGeneration)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    await ConnectCoreAsync(
+                            activeRecord.Id,
+                            operation: "reconnect",
+                            restartCts.Token)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    connectionGeneration = Interlocked.Read(ref _generation);
+                    lifecycle = _activeLifecycle;
+                    tunnelGeneration = _tunnelManager.OwnershipGeneration;
+                }
+                if (lifecycle is null ||
+                    !IsCurrentGatewayAttempt(connectionGeneration, activeRecord.Id) ||
+                    !_tunnelManager.IsActive ||
+                    _tunnelManager.ActiveConfig != ownedTunnelConfig)
+                {
+                    return false;
+                }
+
+                handshakeCompletion = new TaskCompletionSource<bool>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                stateHandler = (_, snapshot) =>
+                {
+                    if (restartGeneration != Interlocked.Read(ref _manualSshRestartGeneration) ||
+                        connectionGeneration != Interlocked.Read(ref _generation) ||
+                        !ReferenceEquals(lifecycle, _activeLifecycle))
+                    {
+                        handshakeCompletion.TrySetResult(false);
+                        return;
+                    }
+
+                    if (snapshot.OperatorState == RoleConnectionState.Connected)
+                        handshakeCompletion.TrySetResult(true);
+                    else if (snapshot.OperatorState is RoleConnectionState.Error
+                        or RoleConnectionState.PairingRequired)
+                        handshakeCompletion.TrySetResult(false);
+                };
+                StateChanged += stateHandler;
+                if (_stateMachine.Current.OperatorState == RoleConnectionState.Connected)
+                    handshakeCompletion.TrySetResult(true);
+                else if (_stateMachine.Current.OperatorState is RoleConnectionState.Error
+                    or RoleConnectionState.PairingRequired)
+                    handshakeCompletion.TrySetResult(false);
+            }
+            finally
+            {
+                _transitionSemaphore.Release();
+            }
+
+            if (handshakeCompletion is null ||
+                !await handshakeCompletion.Task.WaitAsync(restartCts.Token).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            await _transitionSemaphore.WaitAsync(restartCts.Token).ConfigureAwait(false);
+            try
+            {
+                var activeRecordId = _registry.ActiveGatewayId;
+                if (restartGeneration != Interlocked.Read(ref _manualSshRestartGeneration) ||
+                    connectionGeneration != Interlocked.Read(ref _generation) ||
+                    !ReferenceEquals(lifecycle, _activeLifecycle) ||
+                    _stateMachine.Current.OperatorState != RoleConnectionState.Connected ||
+                    !lifecycle.DataClient.IsConnectedToGateway ||
+                    gatewayId is null ||
+                    activeRecordId is null ||
+                    !string.Equals(activeRecordId, gatewayId, StringComparison.Ordinal) ||
+                    expectedGatewayRecord is null ||
+                    tunnelConfig is null ||
+                    ownedTunnelConfig is null ||
+                    !IsCurrentSshRegistryRecord(expectedGatewayRecord) ||
+                    _tunnelManager is null ||
+                    !_tunnelManager.IsActive ||
+                    _tunnelManager.OwnershipGeneration != tunnelGeneration ||
+                    _tunnelManager.ActiveConfig != ownedTunnelConfig)
+                {
+                    return false;
+                }
+
+                succeeded = await _tunnelManager.IsOwnedListenerReadyAsync(
+                        tunnelConfig,
+                        tunnelConfig.LocalPort,
+                        restartCts.Token)
+                    .ConfigureAwait(false);
+                succeeded = succeeded &&
+                    restartGeneration == Interlocked.Read(ref _manualSshRestartGeneration) &&
+                    connectionGeneration == Interlocked.Read(ref _generation) &&
+                    ReferenceEquals(lifecycle, _activeLifecycle) &&
+                    _stateMachine.Current.OperatorState == RoleConnectionState.Connected &&
+                    lifecycle.DataClient.IsConnectedToGateway &&
+                    _tunnelManager.OwnershipGeneration == tunnelGeneration &&
+                    _tunnelManager.ActiveConfig == ownedTunnelConfig &&
+                    IsCurrentSshRegistryRecord(expectedGatewayRecord);
+                return succeeded;
+            }
+            finally
+            {
+                _transitionSemaphore.Release();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (stateHandler is not null)
+                StateChanged -= stateHandler;
+
+            if (!succeeded)
+            {
+                await CleanupManualSshRestartAsync(
+                        restartGeneration,
+                        connectionGeneration,
+                        lifecycle,
+                        tunnelGeneration,
+                        tunnelConfig)
+                    .ConfigureAwait(false);
+            }
+
+            Interlocked.CompareExchange(ref _manualSshRestartCts, null, restartCts);
+        }
+    }
+
+    private bool IsCurrentSshRegistryRecord(GatewayRecord expectedRecord)
+    {
+        var currentRecord = _registry.GetById(expectedRecord.Id);
+        return currentRecord is not null &&
+            string.Equals(_registry.ActiveGatewayId, expectedRecord.Id, StringComparison.Ordinal) &&
+            IsSameCredentialHandoffRecord(currentRecord, expectedRecord);
+    }
+
+    private async Task CleanupManualSshRestartAsync(
+        long restartGeneration,
+        long connectionGeneration,
+        IGatewayClientLifecycle? lifecycle,
+        long tunnelGeneration,
+        SshTunnelConfig? tunnelConfig)
+    {
+        if (restartGeneration != Interlocked.Read(ref _manualSshRestartGeneration) ||
+            connectionGeneration == 0)
+            return;
+
+        using var cleanupCts = new CancellationTokenSource(_manualSshRestartCleanupTimeout);
+        try
+        {
+            await _transitionSemaphore.WaitAsync(cleanupCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.Warn("[ConnMgr] Timed out waiting to clean up a failed manual SSH restart.");
+            return;
+        }
+        catch (ObjectDisposedException) when (_disposed)
+        {
+            return;
+        }
+        try
+        {
+            if (restartGeneration != Interlocked.Read(ref _manualSshRestartGeneration) ||
+                connectionGeneration != Interlocked.Read(ref _generation) ||
+                !ReferenceEquals(lifecycle, _activeLifecycle))
+            {
+                return;
+            }
+
+            await DisconnectCoreAsync().ConfigureAwait(false);
+            if (tunnelConfig is not null && _tunnelManager is not null)
+            {
+                await _tunnelManager.StopIfOwnedAsync(
+                        tunnelConfig,
+                        tunnelGeneration,
+                        cleanupCts.Token)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cleanupCts.IsCancellationRequested)
+        {
+            _logger.Warn("[ConnMgr] Timed out cleaning up a failed manual SSH restart.");
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
+    public void SetGatewayConnectionIntent(string gatewayId, bool shouldBeConnected)
+    {
+        if (string.IsNullOrWhiteSpace(gatewayId))
+            return;
+
+        lock (_connectionIntentLock)
+        {
+            if (shouldBeConnected)
+                _userDisconnectedGatewayIds.Remove(gatewayId);
+            else
+                _userDisconnectedGatewayIds.Add(gatewayId);
+        }
+    }
+
+    public bool IsAutomaticReconnectAllowed(string gatewayId)
+    {
+        if (string.IsNullOrWhiteSpace(gatewayId))
+            return false;
+        lock (_connectionIntentLock)
+        {
+            return !_userDisconnectedGatewayIds.Contains(gatewayId);
+        }
+    }
+
+    /// <summary>
+    /// True while a user-initiated gateway lifecycle action (manual WSL start/stop/restart) is in
+    /// progress. Managed-local auto-repair observes this to suppress STARTING a new repair.
+    /// </summary>
+    public bool IsManualGatewayLifecycleInProgress => Volatile.Read(ref _manualLeaseHolders) > 0;
+
+    /// <summary>
+    /// Acquires the shared gateway-lifecycle lease for a user-initiated manual WSL operation, awaiting
+    /// it so the manual op is MUTUALLY EXCLUSIVE with an in-flight auto-repair distro restart (whose
+    /// host-side terminate could otherwise kill the manual op's freshly booted VM). Also marks a manual
+    /// holder so the monitor additionally suppresses starting new repairs. Dispose releases the lease.
+    /// </summary>
+    public async Task<IDisposable> BeginManualGatewayLifecycleOperationAsync(CancellationToken cancellationToken = default)
+    {
+        await _gatewayLifecycleLease.WaitAsync(cancellationToken).ConfigureAwait(false);
+        Interlocked.Increment(ref _manualLeaseHolders);
+        return new LeaseScope(this, isManual: true);
+    }
+
+    /// <summary>
+    /// Non-blocking attempt to acquire the shared gateway-lifecycle lease for an automatic repair's
+    /// destructive restart. Returns null if a manual (or another) operation holds it, so the coordinator
+    /// aborts instead of running a concurrent restart. Dispose releases the lease.
+    /// </summary>
+    public IDisposable? TryAcquireGatewayLifecycleLease()
+        => _gatewayLifecycleLease.Wait(0) ? new LeaseScope(this, isManual: false) : null;
+
+    private void ReleaseGatewayLifecycleLease(bool isManual)
+    {
+        if (isManual)
+            Interlocked.Decrement(ref _manualLeaseHolders);
+
+        // Guard against a shutdown dispose-race: the manager may dispose the lease while a manual op
+        // still holds a scope, so releasing here can hit a disposed semaphore. The manual-holder count
+        // is already decremented above, so the monitor cannot get stuck-suppressed.
+        // slopwatch-ignore: SW003 Shutdown dispose-race is expected; the count is already corrected and no caller state improves by surfacing it.
+        try { _gatewayLifecycleLease.Release(); }
+        catch (ObjectDisposedException) { }
+        catch (SemaphoreFullException) { }
+    }
+
+    private sealed class LeaseScope(GatewayConnectionManager owner, bool isManual) : IDisposable
+    {
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                owner.ReleaseGatewayLifecycleLease(isManual);
+        }
+    }
+
+    public async Task SwitchGatewayAsync(string gatewayId)
+    {
+        ThrowIfDisposed();
+        using var lifecycleLease = await BeginManualGatewayLifecycleOperationAsync();
+        await _transitionSemaphore.WaitAsync();
+        try
+        {
+            if (_registry.GetById(gatewayId) == null)
+            {
+                _logger.Warn($"[ConnMgr] Cannot switch gateway — record {gatewayId} not found");
+                _diagnostics.Record("state", "Switch gateway failed", $"Gateway record not found: {gatewayId}");
+                return;
+            }
+
+            var previousActiveId = _registry.ActiveGatewayId;
+            _diagnostics.Record("state", $"Switching active gateway to {gatewayId}");
+            SetGatewayConnectionIntent(gatewayId, shouldBeConnected: true);
+            _registry.SetActive(gatewayId);
+            try
+            {
+                _registry.Save();
+            }
+            catch (Exception ex)
+            {
+                _registry.SetActive(previousActiveId);
+                _logger.Warn($"[ConnMgr] Failed to persist active gateway switch: {ex.Message}");
+                _diagnostics.Record("state", "Switch gateway failed", $"Could not persist active gateway: {ex.Message}");
+                return;
+            }
+
             await DisconnectCoreAsync();
             // Stop tunnel when switching gateways — the new one may not need it.
             // Use a bounded timeout to avoid blocking all connection transitions.
@@ -501,8 +1456,6 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 }
                 catch (Exception ex) { _logger.Warn($"[ConnMgr] Tunnel stop error on gateway switch: {ex.Message}"); }
             }
-            _gatewayNeedsV2Signature = false; // new gateway might support v3
-            _registry.SetActive(gatewayId);
             await ConnectCoreAsync(gatewayId);
         }
         finally
@@ -511,7 +1464,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         }
     }
 
-    public async Task<SetupCodeResult> ApplySetupCodeAsync(string setupCode)
+    public async Task<SetupCodeResult> ApplySetupCodeAsync(string setupCode, SshTunnelConfig? sshTunnel = null)
     {
         ThrowIfDisposed();
 
@@ -526,107 +1479,311 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         if (!GatewayUrlHelper.IsValidGatewayUrl(gatewayUrl))
             return new SetupCodeResult(SetupCodeOutcome.InvalidUrl, "Invalid gateway URL");
 
-        // 3. Disconnect current gateway if any
-        await DisconnectAsync();
-
-        var existing = _registry.FindByUrl(gatewayUrl);
-
-        // New gateway URL → reset v2 signature flag (new gateway might support v3)
-        var isNewGateway = existing == null;
-        if (isNewGateway)
-            _gatewayNeedsV2Signature = false;
-
-        // 4. Create or update gateway record
-        var recordId = existing?.Id ?? Guid.NewGuid().ToString();
-
-        // Setup codes from `openclaw qr` always provide bootstrap tokens.
-        // Store as BootstrapToken so the credential resolver passes IsBootstrapToken=true,
-        // causing the client to send auth.bootstrapToken (not auth.token).
-        var record = (existing ?? new GatewayRecord { Id = recordId }) with
+        using var lifecycleLease = await BeginManualGatewayLifecycleOperationAsync();
+        await _transitionSemaphore.WaitAsync();
+        try
         {
-            Url = gatewayUrl,
-            SharedGatewayToken = existing?.SharedGatewayToken, // preserve existing shared token if any
-            BootstrapToken = decoded.Token ?? existing?.BootstrapToken,
-        };
-        _registry.AddOrUpdate(record);
-        _registry.SetActive(recordId);
-        _registry.Save();
+            var existing = _registry.FindByUrl(gatewayUrl);
 
-        // Ensure identity directory
-        var identityDir = _registry.GetIdentityDirectory(recordId);
-        if (!Directory.Exists(identityDir))
-            Directory.CreateDirectory(identityDir);
+            // 4. Create or update gateway record
+            var recordId = existing?.Id ?? Guid.NewGuid().ToString();
 
-        // Clear stored device tokens so we start fresh with the bootstrap token.
-        // The keypair (device ID) stays — only the tokens are wiped.
-        DeviceIdentityStore.ClearStoredTokens(identityDir, _logger);
-        _diagnostics.Record("setup", $"Setup code applied for {GatewayUrlHelper.SanitizeForDisplay(gatewayUrl)}");
+            // Setup codes from `openclaw qr` always provide bootstrap tokens.
+            // Store as BootstrapToken so the credential resolver passes IsBootstrapToken=true,
+            // causing the client to send auth.bootstrapToken (not auth.token).
+            var record = (existing ?? new GatewayRecord { Id = recordId }) with
+            {
+                Url = gatewayUrl,
+                SharedGatewayToken = existing?.SharedGatewayToken, // preserve existing shared token if any
+                BootstrapToken = decoded.Token ?? existing?.BootstrapToken,
+                SshTunnel = sshTunnel ?? existing?.SshTunnel,
+            };
+            var previousRecord = existing;
+            var previousActiveId = _registry.ActiveGatewayId;
+            _registry.AddOrUpdate(record);
+            _registry.SetActive(recordId);
+            try
+            {
+                _registry.Save();
+            }
+            catch (Exception ex)
+            {
+                if (previousRecord == null)
+                    _registry.Remove(recordId);
+                else
+                    _registry.AddOrUpdate(previousRecord);
+                _registry.SetActive(previousActiveId);
+                _logger.Warn($"[ConnMgr] Failed to persist setup-code gateway update: {ex.Message}");
+                return new SetupCodeResult(SetupCodeOutcome.ConnectionFailed, ex.Message);
+            }
+            SetGatewayConnectionIntent(recordId, shouldBeConnected: true);
 
-        // 5. Connect to new gateway
-        if (!string.IsNullOrWhiteSpace(decoded.Token))
-            _forceBootstrapForGatewayRecordId = recordId;
-        await ConnectAsync(recordId);
+            // 3. Disconnect current gateway only after the new active gateway is persisted.
+            await DisconnectCoreAsync();
+
+            // Ensure identity directory
+            var identityDir = _registry.GetIdentityDirectory(recordId);
+            if (!Directory.Exists(identityDir))
+                Directory.CreateDirectory(identityDir);
+
+            // Force bootstrap for this connection without destroying durable device tokens.
+            // A successful pairing replaces them; a failed attempt leaves the prior pairing intact.
+            _diagnostics.Record("setup", $"Setup code applied for {GatewayUrlHelper.SanitizeForDisplay(gatewayUrl)}");
+
+            // 5. Connect to new gateway
+            if (!string.IsNullOrWhiteSpace(decoded.Token))
+                _forceBootstrapForGatewayRecordId = recordId;
+            try
+            {
+                await ConnectCoreAsync(recordId);
+            }
+            finally
+            {
+                if (_forceBootstrapForGatewayRecordId == recordId)
+                    _forceBootstrapForGatewayRecordId = null;
+            }
+            if (_stateMachine.Current.OperatorState == RoleConnectionState.Error)
+            {
+                return new SetupCodeResult(
+                    SetupCodeOutcome.ConnectionFailed,
+                    _stateMachine.Current.OperatorError ?? "Gateway connection failed.");
+            }
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
 
         return new SetupCodeResult(SetupCodeOutcome.Success, GatewayUrl: gatewayUrl);
     }
 
+    public Task<SetupCodeResult> ConnectWithSharedTokenAsync(
+        string gatewayUrl,
+        string token,
+        SshTunnelConfig? sshTunnel = null) =>
+        ConnectWithSharedTokenAsync(
+            gatewayUrl,
+            token,
+            sshTunnel,
+            onGatewayCommitted: null);
+
     public async Task<SetupCodeResult> ConnectWithSharedTokenAsync(
-        string gatewayUrl, string token, SshTunnelConfig? sshTunnel = null)
+        string gatewayUrl,
+        string token,
+        SshTunnelConfig? sshTunnel,
+        Func<GatewayRecord, CancellationToken, Task>? onGatewayCommitted)
     {
         ThrowIfDisposed();
 
         if (!GatewayUrlHelper.IsValidGatewayUrl(gatewayUrl))
             return new SetupCodeResult(SetupCodeOutcome.InvalidUrl, "Invalid gateway URL");
 
-        // Find or create gateway record (dedup by URL)
-        var existing = _registry.FindByUrl(gatewayUrl);
-        var recordId = existing?.Id ?? Guid.NewGuid().ToString();
-        var identityDir = _registry.GetIdentityDirectory(recordId);
-        var hasDurableTokens =
-            DeviceIdentity.HasStoredDeviceTokenForRole(identityDir, "operator", _logger) ||
-            DeviceIdentity.HasStoredDeviceTokenForRole(identityDir, "node", _logger);
+        ISshTunnelManager? isolatedValidationTunnel = null;
+        SshTunnelConfig? isolatedValidationConfig = null;
+        var gatewayCommitted = false;
 
-        if (existing != null && hasDurableTokens)
-        {
-            var validation = await ValidateSharedTokenBeforeReplacementAsync(
-                gatewayUrl,
-                token,
-                identityDir,
-                existing);
-            if (validation.Outcome != SetupCodeOutcome.Success)
-                return validation;
-        }
-
-        // Disconnect current gateway only after replacement credentials have been validated.
-        await DisconnectAsync();
-
-        var record = (existing ?? new GatewayRecord { Id = recordId }) with
-        {
-            Url = gatewayUrl,
-            SharedGatewayToken = token,
-            BootstrapToken = null,
-            SshTunnel = sshTunnel,
-        };
-        _registry.AddOrUpdate(record);
-
-        // Clear stored device tokens so the shared token is used
-        if (!Directory.Exists(identityDir))
-            Directory.CreateDirectory(identityDir);
-        DeviceIdentityStore.ClearStoredTokens(identityDir, _logger);
-
-        _registry.SetActive(recordId);
-        _registry.Save();
-
-        // Connect to the gateway
         try
         {
-            await ConnectAsync(recordId);
-            return new SetupCodeResult(SetupCodeOutcome.Success, GatewayUrl: gatewayUrl);
+            using var lifecycleLease = await BeginManualGatewayLifecycleOperationAsync();
+            await _transitionSemaphore.WaitAsync();
+            try
+            {
+                var existing = _registry.FindByUrl(gatewayUrl);
+                var recordId = existing?.Id ?? Guid.NewGuid().ToString();
+                var identityDir = _registry.GetIdentityDirectory(recordId);
+                var hasDurableTokens =
+                    DeviceIdentity.HasStoredDeviceTokenForRole(identityDir, "operator", _logger) ||
+                    DeviceIdentity.HasStoredDeviceTokenForRole(identityDir, "node", _logger);
+
+                if (existing != null && hasDurableTokens)
+                {
+                    var validationUrl = gatewayUrl;
+                    if (sshTunnel is not null)
+                    {
+                        if (_tunnelManager is null)
+                        {
+                            return new SetupCodeResult(
+                                SetupCodeOutcome.ConnectionFailed,
+                                "SSH tunnel manager is unavailable; shared token was not sent.");
+                        }
+
+                        var excludedPorts = new HashSet<int>();
+                        if (_tunnelManager.ActiveConfig is { } activeConfig)
+                        {
+                            excludedPorts.Add(activeConfig.LocalPort);
+                            if (activeConfig.IncludeBrowserProxyForward)
+                                excludedPorts.Add(activeConfig.LocalPort + 2);
+                        }
+                        var validationConfig = sshTunnel with
+                        {
+                            IncludeBrowserProxyForward = false,
+                            LocalPort = GetAvailableLoopbackPort(excludedPorts),
+                        };
+                        isolatedValidationConfig = validationConfig;
+                        isolatedValidationTunnel = _validationTunnelFactory();
+                        try
+                        {
+                            validationUrl = await isolatedValidationTunnel
+                                .StartAsync(validationConfig, CancellationToken.None)
+                                .ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            return new SetupCodeResult(
+                                SetupCodeOutcome.ConnectionFailed,
+                                $"SSH tunnel validation failed: {ex.Message}");
+                        }
+                    }
+
+                    var validationRecord = existing with
+                    {
+                        Url = validationUrl,
+                        SharedGatewayToken = token,
+                        SshTunnel = sshTunnel,
+                    };
+                    var validationCredential = new GatewayCredential(
+                        token,
+                        IsBootstrapToken: false,
+                        CredentialResolver.SourceSharedGatewayToken);
+                    var validationAuthorization = await AuthorizeCredentialForEndpointAsync(
+                        validationRecord,
+                        validationCredential,
+                        CancellationToken.None).ConfigureAwait(false);
+                    if (!validationAuthorization.Allowed)
+                    {
+                        return new SetupCodeResult(
+                            SetupCodeOutcome.ConnectionFailed,
+                            validationAuthorization.Detail);
+                    }
+
+                    var validation = await ValidateSharedTokenBeforeReplacementAsync(
+                        validationUrl,
+                        token,
+                        identityDir,
+                        validationRecord,
+                        isolatedValidationTunnel,
+                        isolatedValidationConfig,
+                        isolatedValidationTunnel?.OwnershipGeneration);
+                    if (validation.Outcome != SetupCodeOutcome.Success)
+                        return validation;
+                }
+
+                var record = ((existing ?? new GatewayRecord { Id = recordId }) with
+                    {
+                        Url = gatewayUrl,
+                        SharedGatewayToken = token,
+                        BootstrapToken = null,
+                        SshTunnel = sshTunnel,
+                    })
+                    .PreserveAdvancedFields(existing);
+                var previousRecord = existing;
+                var previousActiveId = _registry.ActiveGatewayId;
+                _registry.AddOrUpdate(record);
+                _registry.SetActive(recordId);
+                var registryPersisted = false;
+                try
+                {
+                    _registry.Save();
+                    registryPersisted = true;
+                    if (onGatewayCommitted is not null)
+                    {
+                        await onGatewayCommitted(record, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    gatewayCommitted = true;
+                }
+                catch (Exception ex)
+                {
+                    if (previousRecord == null)
+                        _registry.Remove(recordId);
+                    else
+                        _registry.AddOrUpdate(previousRecord);
+                    _registry.SetActive(previousActiveId);
+                    string? rollbackError = null;
+                    if (registryPersisted)
+                    {
+                        try
+                        {
+                            _registry.Save();
+                        }
+                        catch (Exception rollbackException)
+                        {
+                            _registry.AddOrUpdate(record);
+                            _registry.SetActive(recordId);
+                            gatewayCommitted = true;
+                            rollbackError =
+                                $" Registry rollback failed; the new gateway remains active: {rollbackException.Message}";
+                        }
+                    }
+                    _logger.Warn($"[ConnMgr] Failed to persist shared-token gateway update: {ex.Message}");
+                    return new SetupCodeResult(
+                        SetupCodeOutcome.ConnectionFailed,
+                        $"{ex.Message}{rollbackError}",
+                        GatewayUrl: gatewayUrl,
+                        GatewayCommitted: gatewayCommitted);
+                }
+
+                if (isolatedValidationTunnel is not null)
+                {
+                    await StopAndDisposeValidationTunnelAsync(isolatedValidationTunnel).ConfigureAwait(false);
+                    isolatedValidationTunnel = null;
+                    isolatedValidationConfig = null;
+                }
+                SetGatewayConnectionIntent(recordId, shouldBeConnected: true);
+
+                // Disconnect current gateway only after replacement credentials have been validated and persisted.
+                await DisconnectCoreAsync();
+
+                // The replacement shared token was validated above. Preserve durable device tokens;
+                // they remain the preferred credential until a successful re-pair replaces them.
+                if (!Directory.Exists(identityDir))
+                    Directory.CreateDirectory(identityDir);
+
+                // Connect to the gateway
+                await ConnectCoreAsync(recordId);
+                if (_stateMachine.Current.OperatorState == RoleConnectionState.Error)
+                {
+                    return new SetupCodeResult(
+                        SetupCodeOutcome.ConnectionFailed,
+                        _stateMachine.Current.OperatorError ?? "Gateway connection failed.",
+                        GatewayUrl: gatewayUrl,
+                        GatewayCommitted: true);
+                }
+            }
+            finally
+            {
+                if (isolatedValidationTunnel is not null)
+                    await StopAndDisposeValidationTunnelAsync(isolatedValidationTunnel).ConfigureAwait(false);
+
+                _transitionSemaphore.Release();
+            }
+            return new SetupCodeResult(
+                SetupCodeOutcome.Success,
+                GatewayUrl: gatewayUrl,
+                GatewayCommitted: true);
+        }
+        catch (DeviceIdentityLoadException ex)
+        {
+            var detail = BuildIdentityFailureDetail(ex);
+            _logger.Error($"[ConnMgr] Stored device identity load failed while updating shared credentials: {detail}");
+            _diagnostics.Record(
+                "identity",
+                "Stored device identity could not be loaded while updating shared credentials",
+                detail);
+            return new SetupCodeResult(
+                SetupCodeOutcome.ConnectionFailed,
+                DeviceIdentityLoadException.RecoveryMessage,
+                GatewayUrl: gatewayCommitted ? gatewayUrl : null,
+                GatewayCommitted: gatewayCommitted);
         }
         catch (Exception ex)
         {
             _logger.Error($"[ConnMgr] ConnectWithSharedToken failed: {ex.Message}");
-            return new SetupCodeResult(SetupCodeOutcome.ConnectionFailed, ex.Message);
+            return new SetupCodeResult(
+                SetupCodeOutcome.ConnectionFailed,
+                ex.Message,
+                GatewayUrl: gatewayCommitted ? gatewayUrl : null,
+                GatewayCommitted: gatewayCommitted);
         }
     }
 
@@ -634,21 +1791,20 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         string gatewayUrl,
         string token,
         string identityDir,
-        GatewayRecord existing)
+        GatewayRecord existing,
+        ISshTunnelManager? validationTunnel,
+        SshTunnelConfig? validationTunnelConfig,
+        long? expectedTunnelOwnershipGeneration)
     {
         Directory.CreateDirectory(identityDir);
-        var diagLogger = new DiagnosticTeeLogger(_logger, _diagnostics);
-        using var client = new OpenClawGatewayClient(
+        using var client = CreateSharedTokenValidationClient(
             gatewayUrl,
             token,
-            diagLogger,
-            tokenIsBootstrapToken: false,
-            bootstrapPairAsNode: false,
-            identityPath: identityDir,
-            ignoreStoredDeviceToken: true)
-        {
-            UseV2Signature = existing.IsLocal || existing.RequiresV2Signature
-        };
+            identityDir,
+            existing,
+            validationTunnel,
+            validationTunnelConfig,
+            expectedTunnelOwnershipGeneration);
 
         var completion = new TaskCompletionSource<SetupCodeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         client.HandshakeSucceeded += (_, _) =>
@@ -657,7 +1813,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             completion.TrySetResult(new SetupCodeResult(SetupCodeOutcome.ConnectionFailed, message));
         client.StatusChanged += (_, status) =>
         {
-            if (status == ConnectionStatus.Error)
+            if (status is ConnectionStatus.Error or ConnectionStatus.Disconnected)
                 completion.TrySetResult(new SetupCodeResult(SetupCodeOutcome.ConnectionFailed, "Shared token validation failed"));
         };
 
@@ -681,25 +1837,173 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         }
     }
 
+    internal OpenClawGatewayClient CreateSharedTokenValidationClient(
+        string gatewayUrl,
+        string token,
+        string identityDir,
+        GatewayRecord validationRecord,
+        ISshTunnelManager? validationTunnel,
+        SshTunnelConfig? validationTunnelConfig,
+        long? expectedTunnelOwnershipGeneration = null)
+    {
+        var diagLogger = new DiagnosticTeeLogger(_logger, _diagnostics);
+        expectedTunnelOwnershipGeneration ??= validationTunnel?.OwnershipGeneration;
+        var client = new OpenClawGatewayClient(
+            gatewayUrl,
+            token,
+            diagLogger,
+            tokenIsBootstrapToken: false,
+            bootstrapPairAsNode: false,
+            identityPath: identityDir,
+            ignoreStoredDeviceToken: true,
+            persistHandshakeDeviceTokens: false)
+        {
+            UseV2Signature =
+                validationRecord.IsLocal || validationRecord.RequiresV2Signature
+        };
+        // This is a one-shot validation client. A reconnect would reuse the strong shared token after
+        // ownership may have changed; fail the validation instead and let the caller retry from a new
+        // provenance preflight.
+        client.ReconnectAuthorizationAsync = _ => Task.FromResult(
+            new ReconnectAuthorizationResult(
+                false,
+                GatewayErrorKind.Auth,
+                "Shared-token validation is one-shot."));
+        client.HandshakeAuthorizationAsync = cancellationToken =>
+            AuthorizeValidationCredentialHandshakeAsync(
+                validationRecord,
+                new GatewayCredential(
+                    token,
+                    IsBootstrapToken: false,
+                    CredentialResolver.SourceSharedGatewayToken),
+                validationTunnel,
+                validationTunnelConfig,
+                expectedTunnelOwnershipGeneration,
+                cancellationToken);
+        return client;
+    }
+
+    internal static async Task<ReconnectAuthorizationResult> AuthorizeValidationTunnelHandshakeAsync(
+        ISshTunnelManager validationTunnel,
+        SshTunnelConfig validationTunnelConfig,
+        long expectedOwnershipGeneration,
+        CancellationToken cancellationToken)
+    {
+        var allowed = await validationTunnel
+            .IsOwnedListenerReadyAsync(
+                validationTunnelConfig,
+                validationTunnelConfig.LocalPort,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return allowed && validationTunnel.OwnershipGeneration == expectedOwnershipGeneration
+            ? new ReconnectAuthorizationResult(true, GatewayErrorKind.Unknown, string.Empty)
+            : new ReconnectAuthorizationResult(
+                false,
+                GatewayErrorKind.LocalPortConflict,
+                "The isolated SSH validation listener changed before authentication, so the shared token was not sent.");
+    }
+
+    internal async Task<ReconnectAuthorizationResult> AuthorizeValidationCredentialHandshakeAsync(
+        GatewayRecord validationRecord,
+        GatewayCredential validationCredential,
+        ISshTunnelManager? validationTunnel,
+        SshTunnelConfig? validationTunnelConfig,
+        long? expectedTunnelOwnershipGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (validationTunnel is not null && validationTunnelConfig is not null)
+        {
+            if (!expectedTunnelOwnershipGeneration.HasValue)
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.LocalPortConflict,
+                    "The isolated SSH validation listener ownership could not be pinned, so the shared token was not sent.");
+            }
+            return await AuthorizeValidationTunnelHandshakeAsync(
+                    validationTunnel,
+                    validationTunnelConfig,
+                    expectedTunnelOwnershipGeneration.Value,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var authorization = await AuthorizeCredentialForEndpointAsync(
+                validationRecord,
+                validationCredential,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new ReconnectAuthorizationResult(
+            authorization.Allowed,
+            authorization.FailureKind,
+            authorization.Detail);
+    }
+
+    private async Task StopAndDisposeValidationTunnelAsync(ISshTunnelManager tunnel)
+    {
+        try
+        {
+            if (tunnel.IsActive)
+                await tunnel.StopAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[ConnMgr] Failed to stop the isolated SSH validation tunnel: {ex.Message}");
+        }
+        finally
+        {
+            try
+            {
+                tunnel.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"[ConnMgr] Failed to dispose the isolated SSH validation tunnel: {ex.Message}");
+            }
+        }
+    }
+
+    private static int GetAvailableLoopbackPort(IReadOnlySet<int> excludedPorts)
+    {
+        for (var attempt = 0; attempt < 16; attempt++)
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            try
+            {
+                var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+                if (!excludedPorts.Contains(port))
+                    return port;
+            }
+            finally
+            {
+                listener.Stop();
+            }
+        }
+
+        throw new InvalidOperationException("Unable to allocate an isolated SSH validation port.");
+    }
+
     // ─── Event Handlers ───
 
     private async Task HandleOperatorStatusChangedAsync(ConnectionStatus status, long gen)
     {
-        // Check client's pairing status directly — set synchronously before this handler runs
-        var isPairingPending = _activeLifecycle?.DataClient?.IsPairingRequired == true;
-        if (isPairingPending && status is ConnectionStatus.Disconnected or ConnectionStatus.Error)
-            return;
-
         await _transitionSemaphore.WaitAsync();
         try
         {
             if (Interlocked.Read(ref _generation) != gen) return;
 
-            var prev = _stateMachine.Current.OverallState;
+            // Check client's pairing status while holding the transition lock so
+            // a completed pairing cannot race with a stale disconnect/error event.
+            var isPairingPending = _activeLifecycle?.DataClient?.IsPairingRequired == true;
+            if (isPairingPending && status is ConnectionStatus.Disconnected or ConnectionStatus.Error)
+                return;
+
             switch (status)
             {
                 case ConnectionStatus.Connected:
                     _diagnostics.RecordWebSocketEvent("WebSocket connected");
+                    ClearOperatorFailureKind(gen);
                     _stateMachine.TryTransition(ConnectionTrigger.WebSocketConnected);
                     break;
                 case ConnectionStatus.Disconnected:
@@ -707,17 +2011,38 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                     // Don't overwrite PairingRequired — gateway closes socket after pairing required
                     if (_stateMachine.Current.OperatorState != RoleConnectionState.PairingRequired)
                         _stateMachine.TryTransition(ConnectionTrigger.WebSocketDisconnected);
+                    CompleteOperatorTelemetryAttempt(
+                        gen,
+                        "failure",
+                        ConnectionErrorCategory.ServerClose);
                     break;
                 case ConnectionStatus.Error:
                     _diagnostics.RecordWebSocketEvent("WebSocket error");
                     if (_stateMachine.Current.OperatorState != RoleConnectionState.PairingRequired)
-                        _stateMachine.TryTransition(ConnectionTrigger.WebSocketError, "Transport error");
+                    {
+                        // AuthenticationFailed and Status=Error are raised back-to-back and handled
+                        // asynchronously. If the auth handler already promoted the failure to a more
+                        // specific terminal kind (for example LocalPortConflict), never let the later
+                        // generic status handler overwrite it with the original token/transport kind.
+                        if (_stateMachine.Current.OperatorState != RoleConnectionState.Error ||
+                            _stateMachine.Current.OperatorErrorKind is null)
+                        {
+                            _stateMachine.SetOperatorErrorKind(ReadOperatorFailureKind(gen));
+                            _stateMachine.TryTransition(
+                                ConnectionTrigger.WebSocketError,
+                                "Transport error");
+                        }
+                    }
+                    CompleteOperatorTelemetryAttempt(
+                        gen,
+                        "failure",
+                        ConnectionErrorCategory.NetworkUnreachable);
                     break;
                 case ConnectionStatus.Connecting:
                     _diagnostics.RecordWebSocketEvent("WebSocket connecting");
                     break;
             }
-            EmitStateChanged(prev);
+            EmitStateChanged();
         }
         finally
         {
@@ -732,13 +2057,48 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         {
             if (Interlocked.Read(ref _generation) != gen) return;
 
-            if (TryScheduleOperatorTokenRecovery(message, gen))
-                return;
+            var failureKind =
+                ReadOperatorFailureKind(gen) ?? GatewayErrorClassifier.ClassifyWithCode(message);
+            var activeRecord = _activeGatewayRecordId is null
+                ? null
+                : _registry.GetById(_activeGatewayRecordId);
+            var provenance = activeRecord is not null &&
+                GatewayRecordEditing.ResolveManagedDistroName(activeRecord) is not null &&
+                _endpointProvenanceProbe is not null
+                    ? await _endpointProvenanceProbe(activeRecord, CancellationToken.None).ConfigureAwait(false)
+                    : null;
+            var unexpectedManagedLocalOwner =
+                provenance?.Kind is GatewayEndpointProvenanceKind.ConflictingOpenClawGateway
+                    or GatewayEndpointProvenanceKind.UnknownListener;
 
-            var prev = _stateMachine.Current.OverallState;
+            // A wrong local process may report either shared-token mismatch OR device-token mismatch.
+            // In both cases the real failure is endpoint identity, not credentials: never disclose the
+            // shared/bootstrap fallback and let the provenance-gated collision repair own recovery.
+            if (activeRecord is not null &&
+                unexpectedManagedLocalOwner &&
+                failureKind is GatewayErrorKind.DeviceTokenMismatch or GatewayErrorKind.Auth)
+            {
+                failureKind = GatewayErrorKind.LocalPortConflict;
+                _diagnostics.Record(
+                    "setup",
+                    "Managed local gateway port is owned by a different or unverified process",
+                    $"gatewayId={activeRecord.Id}");
+            }
+
+            if (failureKind == GatewayErrorKind.DeviceTokenMismatch &&
+                await TryScheduleOperatorTokenRecoveryAsync(message, gen).ConfigureAwait(false))
+            {
+                return;
+            }
+
             _diagnostics.Record("error", "Authentication failed", message);
+            _stateMachine.SetOperatorErrorKind(failureKind);
             _stateMachine.TryTransition(ConnectionTrigger.AuthenticationFailed, message);
-            EmitStateChanged(prev);
+            CompleteOperatorTelemetryAttempt(
+                gen,
+                "failure",
+                ConnectionErrorCategory.AuthFailure);
+            EmitStateChanged();
         }
         finally
         {
@@ -746,7 +2106,36 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         }
     }
 
-    private bool TryScheduleOperatorTokenRecovery(string message, long gen)
+    private void RecordOperatorFailureKind(long generation, GatewayErrorKind kind)
+    {
+        lock (_operatorFailureLock)
+        {
+            _pendingOperatorFailureGeneration = generation;
+            _pendingOperatorFailureKind = kind;
+        }
+    }
+
+    private GatewayErrorKind? ReadOperatorFailureKind(long generation)
+    {
+        lock (_operatorFailureLock)
+        {
+            return _pendingOperatorFailureGeneration == generation
+                ? _pendingOperatorFailureKind
+                : null;
+        }
+    }
+
+    private void ClearOperatorFailureKind(long generation)
+    {
+        lock (_operatorFailureLock)
+        {
+            if (_pendingOperatorFailureGeneration != generation)
+                return;
+            _pendingOperatorFailureKind = null;
+        }
+    }
+
+    private async Task<bool> TryScheduleOperatorTokenRecoveryAsync(string message, long gen)
     {
         if (!IsOperatorDeviceTokenMismatch(message) ||
             _activeGatewayRecordId == null ||
@@ -757,26 +2146,410 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         }
 
         var record = _registry.GetById(_activeGatewayRecordId);
-        if (record == null || string.IsNullOrWhiteSpace(record.BootstrapToken))
+        if (record == null)
             return false;
+
+        // Recovery clears the rejected device token and reconnects, letting CredentialResolver
+        // fall back to the shared gateway token (preferred) or bootstrap token. Setup clears the
+        // bootstrap token once pairing is durable but leaves the shared token, so a later stale
+        // device token can still self-recover without asking the user for a new token. With no
+        // fallback at all, clearing would only loop, so leave the gateway in Error for manual re-pair.
+        var hasSharedToken = !string.IsNullOrWhiteSpace(record.SharedGatewayToken);
+        var hasBootstrapToken = !string.IsNullOrWhiteSpace(record.BootstrapToken);
+        if (!hasSharedToken && !hasBootstrapToken)
+            return false;
+
+        // SECURITY: clearing the device token downgrades to the more powerful shared/bootstrap
+        // credential. Only do this over a trusted endpoint so a hostile cleartext endpoint cannot
+        // return a device-token-mismatch to induce disclosure of the shared credential.
+        if (!await IsRecoverySafeEndpointAsync(record, CancellationToken.None).ConfigureAwait(false))
+        {
+            _diagnostics.Record("credential", "Skipped operator token recovery: endpoint not trusted for credential fallback");
+            return false;
+        }
 
         if (!DeviceIdentity.TryClearDeviceToken(_activeIdentityPath, _logger))
             return false;
 
         _operatorTokenRecoveryAttemptedGatewayId = _activeGatewayRecordId;
-        _diagnostics.Record("credential", "Cleared stale operator device token; reconnecting with bootstrap token");
+        var fallbackLabel = hasSharedToken ? "shared gateway token" : "bootstrap token";
+        _diagnostics.Record("credential", $"Cleared stale operator device token; reconnecting with {fallbackLabel}");
 
-        ScheduleDelayedReconnect(gen, "[ConnMgr] Operator token recovery reconnect failed");
+        ScheduleDelayedReconnect(gen, "[ConnMgr] Operator token recovery reconnect failed", gatewayId: record.Id);
 
         return true;
     }
 
     private static bool IsOperatorDeviceTokenMismatch(string message) =>
-        message.Contains("device token mismatch", StringComparison.OrdinalIgnoreCase) ||
-        message.Contains("AUTH_DEVICE_TOKEN_MISMATCH", StringComparison.OrdinalIgnoreCase);
+        GatewayErrorClassifier.ClassifyWithCode(message) == GatewayErrorKind.DeviceTokenMismatch;
+
+    // Auto credential recovery clears a device token and falls back to a stronger shared/bootstrap
+    // credential. Restrict that to trusted endpoints (mirrors the Mac app, which only retries
+    // credentials on loopback or explicitly trusted transport): a loopback/local endpoint (traffic
+    // never leaves the machine), an owned SSH tunnel (encrypted, user-configured), or a validated
+    // TLS endpoint (wss/https). A plain ws:// remote endpoint is never eligible.
+    private async Task<bool> IsRecoverySafeEndpointAsync(
+        GatewayRecord record,
+        CancellationToken cancellationToken)
+    {
+        if (GatewayRecordEditing.IsLoopbackEndpoint(record.Url))
+        {
+            if (record.IsLocal || GatewayRecordEditing.ResolveManagedDistroName(record) is not null)
+            {
+                if (_endpointProvenanceProbe is null)
+                    return false;
+                return (await _endpointProvenanceProbe(record, cancellationToken).ConfigureAwait(false)).Kind ==
+                    GatewayEndpointProvenanceKind.ExpectedManagedGateway;
+            }
+            return true;
+        }
+        if (record.SshTunnel is not null)
+        {
+            return _tunnelManager is not null &&
+                await _tunnelManager
+                    .IsOwnedListenerReadyAsync(
+                        record.SshTunnel,
+                        record.SshTunnel.LocalPort,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+        }
+        if (string.IsNullOrWhiteSpace(record.Url))
+            return false;
+        return Uri.TryCreate(record.Url, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Scheme, "wss", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task<EndpointCredentialAuthorization> AuthorizeCredentialForEndpointAsync(
+        GatewayRecord record,
+        GatewayCredential credential,
+        CancellationToken cancellationToken,
+        bool requireSshTunnelOwnership = false)
+    {
+        if (record.SshTunnel is not null)
+        {
+            if (!requireSshTunnelOwnership)
+                return EndpointCredentialAuthorization.AllowedResult;
+
+            if (_tunnelManager is null ||
+                !await _tunnelManager
+                    .IsOwnedListenerReadyAsync(
+                        record.SshTunnel,
+                        record.SshTunnel.LocalPort,
+                        cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                return new EndpointCredentialAuthorization(
+                    false,
+                    _tunnelManager?.IsActive == true
+                        ? GatewayErrorKind.LocalPortConflict
+                        : GatewayErrorKind.Network,
+                    "The configured SSH listener is not owned by the active OpenClaw tunnel, so credentials were not sent.");
+            }
+
+            return EndpointCredentialAuthorization.AllowWithProof(
+                EndpointOwnershipProof.ForSshTunnel(_tunnelManager.OwnershipGeneration));
+        }
+
+        var isStrongCredential =
+            credential.IsBootstrapToken ||
+            string.Equals(
+                credential.Source,
+                CredentialResolver.SourceSharedGatewayToken,
+                StringComparison.Ordinal) ||
+            string.Equals(
+                credential.Source,
+                CredentialResolver.SourceBootstrapToken,
+                StringComparison.Ordinal);
+        var isManagedLoopback =
+            (record.IsLocal || GatewayRecordEditing.ResolveManagedDistroName(record) is not null) &&
+            GatewayRecordEditing.IsLoopbackEndpoint(record.Url);
+        if (!isManagedLoopback)
+            return EndpointCredentialAuthorization.AllowedResult;
+        if (!isStrongCredential)
+        {
+            // Still populate the shared provenance cache used by Chat/Dashboard, but a device token
+            // does not need the stronger-credential gate.
+            if (_endpointProvenanceProbe is not null)
+                _ = await _endpointProvenanceProbe(record, cancellationToken).ConfigureAwait(false);
+            return EndpointCredentialAuthorization.AllowedResult;
+        }
+        if (_endpointProvenanceProbe is null)
+        {
+            return new EndpointCredentialAuthorization(
+                false,
+                GatewayErrorKind.LocalPortConflict,
+                "Managed-local endpoint ownership could not be verified, so OpenClaw did not send the shared or bootstrap token.");
+        }
+
+        var provenance = await _endpointProvenanceProbe(record, cancellationToken).ConfigureAwait(false);
+        if (provenance.Kind == GatewayEndpointProvenanceKind.ExpectedManagedGateway)
+            return EndpointCredentialAuthorization.AllowWithProof(
+                EndpointOwnershipProof.ForManagedGateway(provenance));
+
+        if (provenance.Kind == GatewayEndpointProvenanceKind.NoListener)
+        {
+            return new EndpointCredentialAuthorization(
+                false,
+                GatewayErrorKind.Network,
+                "The managed WSL gateway is not listening yet. Automatic repair can restart it without sending credentials.");
+        }
+
+        return new EndpointCredentialAuthorization(
+            false,
+            GatewayErrorKind.LocalPortConflict,
+            provenance.Detail ??
+                "The managed gateway address is owned by an unverified process. OpenClaw did not send the shared or bootstrap token.");
+    }
+
+    private async Task<ReconnectAuthorizationResult> AuthorizeCredentialHandoffAsync(
+        GatewayRecord expectedRecord,
+        GatewayCredential credential,
+        EndpointOwnershipProof? expectedOwnership,
+        Func<bool> isCurrentAttempt,
+        CancellationToken operationCancellationToken,
+        CancellationToken handshakeCancellationToken,
+        string role)
+    {
+        using var timeoutCts = new CancellationTokenSource(_credentialHandoffTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            operationCancellationToken,
+            handshakeCancellationToken,
+            timeoutCts.Token);
+
+        try
+        {
+            if (!isCurrentAttempt())
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.Unknown,
+                    $"{role} connection attempt was superseded.");
+            }
+
+            var currentRecord = _registry.GetById(expectedRecord.Id);
+            if (currentRecord is null ||
+                !string.Equals(_registry.ActiveGatewayId, expectedRecord.Id, StringComparison.Ordinal) ||
+                !IsSameCredentialHandoffRecord(currentRecord, expectedRecord))
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.LocalPortConflict,
+                    $"The active gateway endpoint, credentials, or SSH configuration changed before the {role} credential handoff.");
+            }
+
+            var authorization = await AuthorizeCredentialForEndpointAsync(
+                    currentRecord,
+                    credential,
+                    linkedCts.Token,
+                    requireSshTunnelOwnership: true)
+                .ConfigureAwait(false);
+            if (!isCurrentAttempt())
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.Unknown,
+                    $"{role} connection attempt was superseded.");
+            }
+
+            var verifiedRecord = _registry.GetById(expectedRecord.Id);
+            if (verifiedRecord is null ||
+                !string.Equals(_registry.ActiveGatewayId, expectedRecord.Id, StringComparison.Ordinal) ||
+                !IsSameCredentialHandoffRecord(verifiedRecord, expectedRecord))
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.LocalPortConflict,
+                    $"The active gateway endpoint, credentials, or SSH configuration changed during the {role} credential handoff.");
+            }
+
+            if (authorization.Allowed &&
+                expectedOwnership is not null &&
+                authorization.OwnershipProof != expectedOwnership)
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.LocalPortConflict,
+                    $"Endpoint ownership changed after preflight, so {role} credentials were not sent.");
+            }
+
+            return new ReconnectAuthorizationResult(
+                authorization.Allowed,
+                authorization.FailureKind,
+                authorization.Detail);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!isCurrentAttempt() || operationCancellationToken.IsCancellationRequested)
+            {
+                return new ReconnectAuthorizationResult(
+                    false,
+                    GatewayErrorKind.Unknown,
+                    $"{role} connection attempt was superseded or canceled.");
+            }
+
+            return new ReconnectAuthorizationResult(
+                false,
+                GatewayErrorKind.Network,
+                $"Timed out re-verifying the owned SSH listener before the {role} credential handoff.");
+        }
+    }
+
+    private static bool IsSameCredentialHandoffRecord(
+        GatewayRecord current,
+        GatewayRecord expected) =>
+        string.Equals(current.Id, expected.Id, StringComparison.Ordinal) &&
+        string.Equals(current.Url, expected.Url, StringComparison.Ordinal) &&
+        string.Equals(
+            current.SharedGatewayToken,
+            expected.SharedGatewayToken,
+            StringComparison.Ordinal) &&
+        string.Equals(
+            current.BootstrapToken,
+            expected.BootstrapToken,
+            StringComparison.Ordinal) &&
+        current.IsLocal == expected.IsLocal &&
+        current.RequiresV2Signature == expected.RequiresV2Signature &&
+        string.Equals(
+            current.SetupManagedDistroName,
+            expected.SetupManagedDistroName,
+            StringComparison.Ordinal) &&
+        current.SshTunnel == expected.SshTunnel;
+
+    private readonly record struct EndpointCredentialAuthorization(
+        bool Allowed,
+        GatewayErrorKind FailureKind,
+        string Detail,
+        EndpointOwnershipProof? OwnershipProof = null)
+    {
+        public static EndpointCredentialAuthorization AllowedResult { get; } =
+            new(true, GatewayErrorKind.Unknown, string.Empty);
+
+        public static EndpointCredentialAuthorization AllowWithProof(EndpointOwnershipProof ownershipProof) =>
+            new(true, GatewayErrorKind.Unknown, string.Empty, ownershipProof);
+    }
+
+    private sealed record EndpointOwnershipProof(
+        string Kind,
+        long? TunnelGeneration,
+        int? ProcessId,
+        DateTime? ProcessStartTimeUtc,
+        string? ProcessPath)
+    {
+        public static EndpointOwnershipProof ForSshTunnel(long generation) =>
+            new("ssh", generation, null, null, null);
+
+        public static EndpointOwnershipProof ForManagedGateway(GatewayEndpointProvenance provenance) =>
+            new(
+                "managed-local",
+                null,
+                provenance.ProcessId,
+                provenance.ProcessStartTimeUtc,
+                provenance.ProcessPath);
+    }
+
+    // Node device-token recovery mirrors operator recovery but clears ONLY the node token and
+    // reconnects the node, leaving operator credentials untouched. Queued off the connection-failure
+    // handler (which runs under the connector's client-lifecycle lock) so the disk clear + reconnect
+    // never run under that lock. Generations captured at failure time are pinned so a newer node
+    // attempt supersedes this recovery.
+    private async Task HandleNodeDeviceTokenMismatchAsync(long lifecycleGeneration, long nodeGeneration)
+    {
+        try
+        {
+            if (!IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+                return;
+
+            await _transitionSemaphore.WaitAsync();
+            try
+            {
+                if (!IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+                    return;
+
+                var gatewayRecordId = _activeGatewayRecordId;
+                var identityPath = _activeIdentityPath;
+                if (gatewayRecordId == null ||
+                    identityPath == null ||
+                    _nodeTokenRecoveryAttemptedGatewayId == gatewayRecordId)
+                {
+                    return;
+                }
+
+                // The node reconnect needs a live operator; if the operator is down the operator
+                // recovery path drives the full reconnect instead.
+                if (_stateMachine.Current.OperatorState != RoleConnectionState.Connected)
+                    return;
+
+                var record = _registry.GetById(gatewayRecordId);
+                if (record == null)
+                    return;
+
+                var hasSharedToken = !string.IsNullOrWhiteSpace(record.SharedGatewayToken);
+                var hasBootstrapToken = !string.IsNullOrWhiteSpace(record.BootstrapToken);
+                if (!hasSharedToken && !hasBootstrapToken)
+                    return;
+
+                if (!await IsRecoverySafeEndpointAsync(record, CancellationToken.None).ConfigureAwait(false))
+                {
+                    _diagnostics.Record("credential", "Skipped node token recovery: endpoint not trusted for credential fallback");
+                    return;
+                }
+
+                if (!DeviceIdentity.TryClearDeviceTokenForRole(identityPath, "node", _logger))
+                    return;
+
+                _nodeTokenRecoveryAttemptedGatewayId = gatewayRecordId;
+                var fallbackLabel = hasSharedToken ? "shared gateway token" : "bootstrap token";
+                _diagnostics.Record("credential", $"Cleared stale node device token; reconnecting node with {fallbackLabel}");
+            }
+            finally
+            {
+                _transitionSemaphore.Release();
+            }
+
+            ScheduleDelayedNodeReconnect(lifecycleGeneration, nodeGeneration);
+        }
+        // slopwatch-ignore: SW003 Shutdown/disposal is expected; caller preserves safe state.
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[ConnMgr] Node token recovery failed: {ex.Message}");
+            _diagnostics.Record("credential", "Node token recovery failed", ex.Message);
+        }
+    }
+
+    // Reconnects the node outside the transition semaphore, pinning BOTH the lifecycle and node
+    // generations so a newer node attempt started during the delay wins and this superseded
+    // recovery is dropped.
+    private void ScheduleDelayedNodeReconnect(long lifecycleGeneration, long nodeGeneration)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _reconnectDelay(TimeSpan.FromMilliseconds(200));
+                if (_disposed || !IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+                    return;
+
+                await StartNodeConnectionAsync(lifecycleGeneration, nodeGeneration);
+            }
+            // slopwatch-ignore: SW003 Shutdown cancellation or disposal is expected; caller preserves safe state.
+            catch (ObjectDisposedException) { }
+            catch (Exception ex)
+            {
+                _logger.Warn($"[ConnMgr] Node token recovery reconnect failed: {ex.Message}");
+                _diagnostics.Record("credential", "Node token recovery reconnect failed", ex.Message);
+            }
+        });
+    }
 
     private async Task HandleHandshakeSucceededAsync(long gen)
     {
+        bool shouldStartNodeConnection = false;
+        bool missingGatewayRecordForNode = false;
+        bool missingActiveGatewayForNode = false;
+        bool missingNodeConnector = false;
+        NodeStartGuardLease? automaticNodeStartGuard = null;
         await _transitionSemaphore.WaitAsync();
         try
         {
@@ -785,7 +2558,8 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             var prev = _stateMachine.Current.OverallState;
             _diagnostics.Record("state", "Handshake succeeded (hello-ok)");
             _stateMachine.TryTransition(ConnectionTrigger.HandshakeSucceeded);
-            _diagnostics.RecordStateChange(prev, _stateMachine.Current.OverallState);
+            CompleteOperatorTelemetryAttempt(gen, "success");
+            var nodeModeIntended = SyncNodeIntentFromSettings();
             if (_operatorTokenRecoveryAttemptedGatewayId == _activeGatewayRecordId)
                 _operatorTokenRecoveryAttemptedGatewayId = null;
 
@@ -795,7 +2569,60 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 _stateMachine.SetOperatorDeviceId(client.OperatorDeviceId);
             }
 
-            EmitStateChanged(prev);
+            missingActiveGatewayForNode =
+                nodeModeIntended &&
+                (_activeGatewayRecordId == null || _activeIdentityPath == null);
+            missingGatewayRecordForNode =
+                nodeModeIntended &&
+                !missingActiveGatewayForNode &&
+                _activeGatewayRecordId != null &&
+                _registry.GetById(_activeGatewayRecordId) == null;
+            shouldStartNodeConnection =
+                !missingActiveGatewayForNode &&
+                !missingGatewayRecordForNode &&
+                ShouldStartNodeConnection();
+            missingNodeConnector = shouldStartNodeConnection && _nodeConnector == null;
+            if (shouldStartNodeConnection && !missingNodeConnector)
+            {
+                lock (_nodeOperationLock)
+                {
+                    if (Interlocked.Read(ref _nodeStartLifecycleGeneration) == gen)
+                    {
+                        shouldStartNodeConnection = false;
+                    }
+                    else
+                    {
+                        automaticNodeStartGuard = new NodeStartGuardLease
+                        {
+                            Version = AcquireNodeStartGuard(gen)
+                        };
+                    }
+                }
+            }
+            if (missingActiveGatewayForNode)
+            {
+                _stateMachine.BlockNodeStart(MissingActiveGatewayForNodeMessage);
+            }
+            else if (missingGatewayRecordForNode)
+            {
+                _stateMachine.BlockNodeStart(MissingGatewayRecordForNodeMessage);
+            }
+            else if (missingNodeConnector)
+            {
+                _stateMachine.BlockNodeStart(MissingNodeConnectorMessage);
+            }
+            else if (shouldStartNodeConnection)
+            {
+                _stateMachine.SetNodeEnabled(true);
+                if (_nodeConnector != null)
+                {
+                    _stateMachine.StartNodeConnecting();
+                    _stateMachine.SetNodeCredentialSource(null);
+                }
+            }
+
+            _diagnostics.RecordStateChange(prev, _stateMachine.Current.OverallState);
+            EmitStateChanged();
 
             // Stamp LastConnected so auto-reconnect on next startup can use this gateway.
             // Uses the atomic Update helper to avoid overwriting concurrent registry changes.
@@ -818,46 +2645,99 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             _transitionSemaphore.Release();
         }
 
-        // Start node connection outside the semaphore to avoid deadlocks
-        if (_nodeConnector != null && ShouldStartNodeConnection())
+        // Start node connection outside the semaphore to avoid deadlocks.
+        // If Node mode is intended but no connector exists, publish the blocker
+        // through the same manager snapshot instead of leaving node Idle/healthy.
+        if (missingActiveGatewayForNode || missingGatewayRecordForNode || missingNodeConnector)
         {
-            await StartNodeConnectionAsync(gen);
+            return;
+        }
+
+        if (shouldStartNodeConnection)
+        {
+            if (_nodeConnector != null)
+                await StartNodeConnectionAsync(gen, guardLease: automaticNodeStartGuard);
         }
     }
 
-    private void HandleDeviceTokenReceived(DeviceTokenReceivedEventArgs e)
+    private async Task HandleDeviceTokenReceivedAsync(
+        DeviceTokenReceivedEventArgs e,
+        long gen,
+        string gatewayRecordId,
+        string identityPath)
     {
-        _diagnostics.Record("credential", $"Device token received for {e.Role}",
-            $"Scopes={string.Join(",", e.Scopes ?? [])}");
-
-        if (_identityStore != null && _activeIdentityPath != null)
+        await _transitionSemaphore.WaitAsync();
+        try
         {
-            try
-            {
-                _identityStore.StoreToken(_activeIdentityPath, e.Token, e.Scopes, e.Role);
-                _logger.Info($"[ConnMgr] Persisted {e.Role} device token via identity store");
-            }
-            catch (Exception ex)
-            {
-                _logger.Warn($"[ConnMgr] Failed to persist {e.Role} device token: {ex.Message}");
-            }
-        }
+            if (!IsCurrentGatewayAttempt(gen, gatewayRecordId))
+                return;
 
-        TryClearBootstrapTokenAfterDurablePairing();
-        TrySchedulePostBootstrapOperatorReconnect(e);
+            _diagnostics.Record("credential", $"Device token received for {e.Role}",
+                $"Scopes={string.Join(",", e.Scopes ?? [])}");
+
+            if (_identityStore != null)
+            {
+                try
+                {
+                    _identityStore.StoreToken(identityPath, e.Token, e.Scopes, e.Role);
+                    _logger.Info($"[ConnMgr] Persisted {e.Role} device token via identity store");
+                }
+                catch (DeviceIdentityLoadException ex)
+                {
+                    var detail = BuildIdentityFailureDetail(ex);
+                    _logger.Error($"[ConnMgr] Stored device identity load failed while persisting {e.Role} token: {detail}");
+                    _diagnostics.Record(
+                        "identity",
+                        "Stored device identity could not be loaded while persisting a device token",
+                        detail);
+                    _stateMachine.TryTransition(
+                        ConnectionTrigger.WebSocketError,
+                        DeviceIdentityLoadException.RecoveryMessage);
+                    EmitStateChanged();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"[ConnMgr] Failed to persist {e.Role} device token: {ex.Message}");
+                    _diagnostics.Record(
+                        "identity",
+                        $"Failed to persist {e.Role} device token",
+                        ex.Message);
+                    return;
+                }
+            }
+
+            TryClearBootstrapTokenAfterDurablePairing(gatewayRecordId, identityPath);
+            TrySchedulePostBootstrapOperatorReconnect(e, gen, gatewayRecordId, identityPath);
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
     }
 
     private void TryClearBootstrapTokenAfterDurablePairing()
     {
-        if (_activeGatewayRecordId == null || _activeIdentityPath == null)
+        var activeGatewayRecordId = _activeGatewayRecordId;
+        var activeIdentityPath = _activeIdentityPath;
+        if (activeGatewayRecordId == null || activeIdentityPath == null)
             return;
 
-        var record = _registry.GetById(_activeGatewayRecordId);
+        TryClearBootstrapTokenAfterDurablePairing(activeGatewayRecordId, activeIdentityPath);
+    }
+
+    private void TryClearBootstrapTokenAfterDurablePairing(string gatewayRecordId, string identityPath)
+    {
+        var record = _registry.GetById(gatewayRecordId);
         if (record?.BootstrapToken == null)
             return;
 
-        var hasOperatorToken = DeviceIdentity.HasStoredDeviceTokenForRole(_activeIdentityPath, "operator", _logger);
-        var hasNodeToken = DeviceIdentity.HasStoredDeviceTokenForRole(_activeIdentityPath, "node", _logger);
+        if (!TryReadStoredTokenPresence(identityPath, "operator", "clearing bootstrap credentials", out var hasOperatorToken)
+            || !TryReadStoredTokenPresence(identityPath, "node", "clearing bootstrap credentials", out var hasNodeToken))
+        {
+            return;
+        }
+
         if (!hasOperatorToken || !hasNodeToken)
         {
             _diagnostics.Record(
@@ -867,24 +2747,46 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             return;
         }
 
-        _registry.AddOrUpdate(record with { BootstrapToken = null });
-        _registry.Save();
-        _diagnostics.Record("credential", "Cleared bootstrap token — operator and node tokens are durable");
+        try
+        {
+            var updated = _registry.UpdateAndSave(
+                gatewayRecordId,
+                r => r with { BootstrapToken = null });
+            if (updated == null)
+                return;
+
+            _diagnostics.Record("credential", "Cleared bootstrap token — operator and node tokens are durable");
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[ConnMgr] Failed to persist cleared bootstrap token: {ex.Message}");
+            _diagnostics.Record("credential", "Failed to persist cleared bootstrap token", ex.Message);
+        }
     }
 
-    private void TrySchedulePostBootstrapOperatorReconnect(DeviceTokenReceivedEventArgs e)
+    private void TrySchedulePostBootstrapOperatorReconnect(
+        DeviceTokenReceivedEventArgs e,
+        long gen,
+        string gatewayRecordId,
+        string identityPath)
     {
-        if (!_activeConnectUsedBootstrapToken ||
-            _postBootstrapOperatorReconnectScheduled ||
-            _activeIdentityPath == null ||
-            _activeGatewayRecordId == null)
+        if (!IsCurrentGatewayAttempt(gen, gatewayRecordId) ||
+            !_activeConnectUsedBootstrapToken ||
+            _postBootstrapOperatorReconnectScheduled)
         {
             return;
         }
 
-        var hasOperatorToken = !string.IsNullOrWhiteSpace(
-            DeviceIdentity.TryReadStoredDeviceTokenForRole(_activeIdentityPath, "operator", _logger));
-        var record = _registry.GetById(_activeGatewayRecordId);
+        if (!TryReadStoredTokenPresence(
+                identityPath,
+                "operator",
+                "scheduling the post-bootstrap operator reconnect",
+                out var hasOperatorToken))
+        {
+            return;
+        }
+
+        var record = _registry.GetById(gatewayRecordId);
         var canReconnectWithSharedToken = !string.IsNullOrWhiteSpace(record?.SharedGatewayToken);
 
         if (!hasOperatorToken && !canReconnectWithSharedToken)
@@ -894,23 +2796,24 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             return;
 
         _postBootstrapOperatorReconnectScheduled = true;
-        var reconnectGeneration = Interlocked.Read(ref _generation);
         var detail = hasOperatorToken
             ? "using persisted operator device token"
             : "using preserved shared gateway token";
-        RememberGatewayNeedsV2Signature(_activeGatewayRecordId);
+        RememberGatewayNeedsV2Signature(gatewayRecordId, markActiveAttempt: true);
         _diagnostics.Record("credential", "Bootstrap handoff complete — reconnecting operator role", detail);
 
         ScheduleDelayedReconnect(
-            reconnectGeneration,
+            gen,
             "[ConnMgr] Post-bootstrap operator reconnect failed",
-            ex => _diagnostics.Record("credential", "Post-bootstrap operator reconnect failed", ex.Message));
+            ex => _diagnostics.Record("credential", "Post-bootstrap operator reconnect failed", ex.Message),
+            gatewayId: gatewayRecordId);
     }
 
     private void ScheduleDelayedReconnect(
         long generation,
         string warningPrefix,
-        Action<Exception>? onFailure = null)
+        Action<Exception>? onFailure = null,
+        string? gatewayId = null)
     {
         _ = Task.Run(async () =>
         {
@@ -920,7 +2823,14 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 if (_disposed || Interlocked.Read(ref _generation) != generation)
                     return;
 
-                await ReconnectAsync();
+                // Pin the reconnect to the gateway this recovery was scheduled for. The generation
+                // check above does not cover an out-of-band SetActive (the UI sets the active gateway
+                // before calling SwitchGatewayAsync, which is what bumps the generation), so a global
+                // ReconnectAsync() could reconnect/disrupt a different gateway the user just switched to.
+                if (gatewayId is not null)
+                    await ReconnectIfCurrentAsync(gatewayId);
+                else
+                    await ReconnectAsync();
             }
             // slopwatch-ignore: SW003 Shutdown cancellation or disposal is expected and the caller already preserves the safe state.
             catch (ObjectDisposedException) { }
@@ -932,9 +2842,25 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         });
     }
 
-    private void RememberGatewayNeedsV2Signature(string? gatewayRecordId)
+    private async Task HandleV2SignatureFallbackAsync(long gen, string gatewayRecordId)
     {
-        _gatewayNeedsV2Signature = true;
+        await _transitionSemaphore.WaitAsync();
+        try
+        {
+            RememberGatewayNeedsV2Signature(
+                gatewayRecordId,
+                markActiveAttempt: IsCurrentGatewayAttempt(gen, gatewayRecordId));
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
+    private void RememberGatewayNeedsV2Signature(string? gatewayRecordId, bool markActiveAttempt = true)
+    {
+        if (markActiveAttempt)
+            _gatewayNeedsV2Signature = true;
 
         if (string.IsNullOrWhiteSpace(gatewayRecordId))
             return;
@@ -961,10 +2887,14 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             var prev = _stateMachine.Current.OverallState;
             _diagnostics.Record("pairing", $"Pairing required — waiting for approval (requestId={requestId})");
             _stateMachine.TryTransition(ConnectionTrigger.PairingPending);
+            CompleteOperatorTelemetryAttempt(
+                gen,
+                "pairing_required",
+                ConnectionErrorCategory.PairingPending);
             // Store requestId in snapshot so setup flows can use it for explicit approval
             _stateMachine.SetOperatorPairingRequestId(requestId);
             _diagnostics.RecordStateChange(prev, _stateMachine.Current.OverallState);
-            EmitStateChanged(prev);
+            EmitStateChanged();
         }
         finally
         {
@@ -1087,6 +3017,18 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         return _isNodeEnabled?.Invoke() ?? false;
     }
 
+    private bool SyncNodeIntentFromSettings()
+    {
+        var enabled = _isNodeEnabled?.Invoke() ?? false;
+        if (_stateMachine.Current.NodeConnectionIntended != enabled ||
+            (!enabled && _stateMachine.Current.NodeState != RoleConnectionState.Disabled))
+        {
+            _stateMachine.SetNodeEnabled(enabled);
+        }
+
+        return enabled;
+    }
+
     private bool IsCurrentNodeAttempt(long lifecycleGeneration, long nodeGeneration) =>
         !_disposed &&
         Interlocked.Read(ref _generation) == lifecycleGeneration &&
@@ -1094,11 +3036,42 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
     private async Task<long?> StartNodeConnectionAsync(
         long expectedLifecycleGeneration,
-        long? expectedNodeGeneration = null)
+        long? expectedNodeGeneration = null,
+        NodeStartGuardLease? guardLease = null)
     {
-        CancellationTokenSource nodeOperationCts;
-        CancellationToken nodeOperationToken;
-        long nodeGeneration;
+        guardLease ??= new NodeStartGuardLease();
+
+        var startedGeneration = await StartNodeConnectionAttemptAsync(
+            expectedLifecycleGeneration,
+            expectedNodeGeneration,
+            guardLease);
+        if (!startedGeneration.HasValue && guardLease.Version.HasValue)
+        {
+            lock (_nodeOperationLock)
+            {
+                if (Interlocked.Read(ref _nodeStartGuardVersion) == guardLease.Version.Value)
+                {
+                    Interlocked.CompareExchange(
+                        ref _nodeStartLifecycleGeneration,
+                        -1,
+                        expectedLifecycleGeneration);
+                }
+            }
+        }
+
+        return startedGeneration;
+    }
+
+    private async Task<long?> StartNodeConnectionAttemptAsync(
+        long expectedLifecycleGeneration,
+        long? expectedNodeGeneration,
+        NodeStartGuardLease guardLease)
+    {
+        CancellationTokenSource? nodeOperationCts = null;
+        CancellationToken nodeOperationToken = CancellationToken.None;
+        long nodeGeneration = 0;
+        string? preStartBlocker = null;
+        CancellationToken preStartBlockerToken = CancellationToken.None;
 
         await _nodeStartSemaphore.WaitAsync();
         try
@@ -1109,10 +3082,25 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, expectedNodeGeneration))
                     return null;
 
+                if (guardLease.Version.HasValue)
+                {
+                    if (Interlocked.Read(ref _nodeStartGuardVersion) != guardLease.Version.Value ||
+                        Interlocked.Read(ref _nodeStartLifecycleGeneration) != expectedLifecycleGeneration)
+                    {
+                        return null;
+                    }
+                }
+                else
+                {
+                    guardLease.Version = AcquireNodeStartGuard(expectedLifecycleGeneration);
+                }
+
                 oldNodeOperationCts = _nodeOperationCts;
                 _nodeOperationCts = null;
                 oldNodeOperationCts?.Cancel();
             }
+
+            CancelNodeTelemetryAttempt("superseded", null);
 
             if (_nodeConnector != null)
             {
@@ -1124,26 +3112,37 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                             "Previous node disconnect"))
                     {
                         _diagnostics.Record("node", "Previous node disconnect timed out");
-                        return null;
+                        preStartBlocker = "Previous node disconnect timed out";
+                        preStartBlockerToken = _operationCts?.Token ?? CancellationToken.None;
                     }
                 }
                 catch (Exception ex)
                 {
                     _logger.Error($"[ConnMgr] Previous node disconnect failed: {ex.Message}");
                     _diagnostics.Record("node", "Previous node disconnect failed", ex.Message);
-                    return null;
+                    preStartBlocker = $"Previous node disconnect failed: {ex.Message}";
+                    preStartBlockerToken = _operationCts?.Token ?? CancellationToken.None;
                 }
             }
 
-            lock (_nodeOperationLock)
+            if (preStartBlocker == null)
             {
-                if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, expectedNodeGeneration))
-                    return null;
+                lock (_nodeOperationLock)
+                {
+                    if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, expectedNodeGeneration))
+                        return null;
 
-                nodeOperationCts = new CancellationTokenSource();
-                nodeOperationToken = nodeOperationCts.Token;
-                nodeGeneration = Interlocked.Increment(ref _nodeConnectionGeneration);
-                _nodeOperationCts = nodeOperationCts;
+                    nodeOperationCts = new CancellationTokenSource();
+                    nodeOperationToken = nodeOperationCts.Token;
+                    nodeGeneration = Interlocked.Increment(ref _nodeConnectionGeneration);
+                    _nodeOperationCts = nodeOperationCts;
+                }
+
+                StartNodeTelemetryAttempt(
+                    expectedLifecycleGeneration,
+                    nodeGeneration,
+                    "connect",
+                    NodePrepareSpanName);
             }
         }
         finally
@@ -1151,14 +3150,30 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             _nodeStartSemaphore.Release();
         }
 
+        if (preStartBlocker != null)
+        {
+            await BlockNodeStartAsync(
+                preStartBlocker,
+                preStartBlockerToken,
+                expectedLifecycleGeneration,
+                expectedNodeGeneration);
+            CancelNodeTelemetryAttempt("superseded", null);
+            RecordNodePreflightTelemetryFailure(ConnectionErrorCategory.InternalError);
+            return null;
+        }
+
         try
         {
-            return await StartNodeConnectionCoreAsync(nodeGeneration, nodeOperationToken)
+            return await StartNodeConnectionCoreAsync(expectedLifecycleGeneration, nodeGeneration, nodeOperationToken)
                 ? nodeGeneration
                 : null;
         }
         catch (OperationCanceledException) when (nodeOperationToken.IsCancellationRequested)
         {
+            CompleteNodeTelemetryAttempt(
+                nodeGeneration,
+                "canceled",
+                ConnectionErrorCategory.Cancelled);
             return null;
         }
         finally
@@ -1168,7 +3183,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 if (ReferenceEquals(_nodeOperationCts, nodeOperationCts))
                     _nodeOperationCts = null;
             }
-            nodeOperationCts.Dispose();
+            nodeOperationCts!.Dispose();
         }
     }
 
@@ -1180,7 +3195,145 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         (!expectedNodeGeneration.HasValue ||
          Interlocked.Read(ref _nodeConnectionGeneration) == expectedNodeGeneration.Value);
 
+    private bool IsCurrentGatewayAttempt(long expectedGeneration, string expectedGatewayId) =>
+        !_disposed &&
+        Interlocked.Read(ref _generation) == expectedGeneration &&
+        string.Equals(_activeGatewayRecordId, expectedGatewayId, StringComparison.Ordinal);
+
+    private static string BuildCredentialFailureMessage(string role, GatewayCredentialResolution resolution)
+    {
+        var prefix = role.Equals("node", StringComparison.OrdinalIgnoreCase)
+            ? "No node credential available"
+            : "No operator credential available";
+        return resolution.Status switch
+        {
+            GatewayCredentialResolutionStatus.Corrupt =>
+                $"{prefix}: stored device token is corrupt. Re-pair this PC or add a shared/bootstrap gateway token.",
+            GatewayCredentialResolutionStatus.Unreadable =>
+                $"{prefix}: stored device token is unreadable. Check file permissions, re-pair this PC, or add a shared/bootstrap gateway token.",
+            GatewayCredentialResolutionStatus.Missing => role.Equals("node", StringComparison.OrdinalIgnoreCase)
+                ? MissingNodeCredentialMessage
+                : $"{prefix}. Add a shared/bootstrap gateway token or re-pair this PC.",
+            _ when !string.IsNullOrWhiteSpace(resolution.Detail) =>
+                $"{prefix}. {resolution.Detail}",
+            _ => role.Equals("node", StringComparison.OrdinalIgnoreCase)
+                ? MissingNodeCredentialMessage
+                : $"{prefix}. Add a shared/bootstrap gateway token or re-pair this PC."
+        };
+    }
+
+    private static string BuildIdentityFailureDetail(DeviceIdentityLoadException ex)
+    {
+        var cause = ex.InnerException;
+        return cause == null
+            ? ex.GetType().Name
+            : $"{cause.GetType().Name}: {cause.Message}";
+    }
+
+    private static bool HasPersistedIdentityFailure(GatewayCredentialResolution resolution) =>
+        resolution.PrimaryStatus is GatewayCredentialResolutionStatus.Unreadable
+            or GatewayCredentialResolutionStatus.Corrupt
+        || resolution.Status is GatewayCredentialResolutionStatus.Unreadable
+            or GatewayCredentialResolutionStatus.Corrupt;
+
+    private bool TryReadStoredTokenPresence(
+        string identityPath,
+        string role,
+        string operation,
+        out bool hasToken)
+    {
+        try
+        {
+            hasToken = DeviceIdentity.HasStoredDeviceTokenForRole(identityPath, role, _logger);
+            return true;
+        }
+        catch (DeviceIdentityLoadException ex)
+        {
+            hasToken = false;
+            var detail = BuildIdentityFailureDetail(ex);
+            _logger.Error($"[ConnMgr] Stored device identity load failed while {operation}: {detail}");
+            _diagnostics.Record(
+                "identity",
+                $"Stored device identity could not be loaded while {operation}",
+                detail);
+            return false;
+        }
+    }
+
+    private async Task BlockNodeStartAsync(
+        string detail,
+        CancellationToken cancellationToken,
+        long? expectedLifecycleGeneration = null,
+        long? expectedNodeGeneration = null)
+    {
+        if (expectedLifecycleGeneration.HasValue &&
+            Interlocked.Read(ref _generation) != expectedLifecycleGeneration.Value)
+        {
+            return;
+        }
+
+        if (expectedNodeGeneration.HasValue &&
+            Interlocked.Read(ref _nodeConnectionGeneration) != expectedNodeGeneration.Value)
+        {
+            return;
+        }
+
+        await _transitionSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (expectedLifecycleGeneration.HasValue &&
+                Interlocked.Read(ref _generation) != expectedLifecycleGeneration.Value)
+            {
+                return;
+            }
+
+            if (expectedNodeGeneration.HasValue &&
+                Interlocked.Read(ref _nodeConnectionGeneration) != expectedNodeGeneration.Value)
+            {
+                return;
+            }
+
+            _stateMachine.BlockNodeStart(detail);
+            EmitStateChanged();
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
+    private async Task RecordOperatorCredentialHandoffFailureAsync(
+        string detail,
+        GatewayErrorKind failureKind,
+        CancellationToken cancellationToken,
+        long expectedLifecycleGeneration,
+        string expectedGatewayId)
+    {
+        if (!IsCurrentGatewayAttempt(expectedLifecycleGeneration, expectedGatewayId))
+            return;
+
+        await _transitionSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (!IsCurrentGatewayAttempt(expectedLifecycleGeneration, expectedGatewayId))
+                return;
+
+            _stateMachine.SetOperatorErrorKind(failureKind);
+            _stateMachine.TryTransition(
+                failureKind == GatewayErrorKind.Network
+                    ? ConnectionTrigger.WebSocketError
+                    : ConnectionTrigger.AuthenticationFailed,
+                detail);
+            EmitStateChanged();
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+    }
+
     private async Task<bool> StartNodeConnectionCoreAsync(
+        long expectedLifecycleGeneration,
         long nodeGeneration,
         CancellationToken cancellationToken)
     {
@@ -1190,30 +3343,141 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             return false;
         }
 
-        if (_nodeConnector == null || _activeGatewayRecordId == null || _activeIdentityPath == null) return false;
-
-        var record = _registry.GetById(_activeGatewayRecordId);
-        if (record == null)
+        if (_nodeConnector == null)
         {
-            _logger.Warn("[ConnMgr] Cannot start node — gateway record not found");
+            await BlockNodeStartAsync(MissingNodeConnectorMessage, cancellationToken, expectedLifecycleGeneration, nodeGeneration);
+            CompleteNodeTelemetryAttempt(nodeGeneration, "failure", ConnectionErrorCategory.InternalError);
             return false;
         }
 
-        // Use root identity path — clients always read/write from root, not per-gateway
-        var nodeCredential = _credentialResolver.ResolveNode(record, _activeIdentityPath!);
-        if (nodeCredential == null)
+        if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, nodeGeneration))
+            return false;
+
+        var activeGatewayRecordId = _activeGatewayRecordId;
+        var activeIdentityPath = _activeIdentityPath;
+        if (activeGatewayRecordId == null || activeIdentityPath == null)
         {
-            _logger.Warn("[ConnMgr] No node credential available — skipping node connection");
-            _diagnostics.Record("node", "No node credential available");
+            await BlockNodeStartAsync(MissingActiveGatewayForNodeMessage, cancellationToken, expectedLifecycleGeneration, nodeGeneration);
+            CompleteNodeTelemetryAttempt(nodeGeneration, "failure", ConnectionErrorCategory.InternalError);
+            return false;
+        }
+
+        var record = _registry.GetById(activeGatewayRecordId);
+        if (record == null)
+        {
+            _logger.Warn("[ConnMgr] Cannot start node — gateway record not found");
+            await BlockNodeStartAsync(MissingGatewayRecordForNodeMessage, cancellationToken, expectedLifecycleGeneration, nodeGeneration);
+            CompleteNodeTelemetryAttempt(nodeGeneration, "failure", ConnectionErrorCategory.InternalError);
             return false;
         }
 
         // Mark node as enabled in the state machine so UI reflects node state
-        // State machine is not thread-safe — acquire semaphore for mutation
+        // before credential resolution can fail. Otherwise node mode could look
+        // healthy even though the intended node never started.
         await _transitionSemaphore.WaitAsync(cancellationToken);
         try
         {
+            if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, nodeGeneration))
+                return false;
+
+            var before = _stateMachine.Current;
             _stateMachine.SetNodeEnabled(true);
+            _stateMachine.StartNodeConnecting();
+            _stateMachine.SetNodeCredentialSource(null);
+            if (_stateMachine.Current != before)
+                EmitStateChanged();
+        }
+        finally
+        {
+            _transitionSemaphore.Release();
+        }
+
+        var nodeCredentialResolution = _credentialResolver.ResolveNodeDetailed(record, activeIdentityPath);
+        var nodeCredential = nodeCredentialResolution.Credential;
+        if (HasPersistedIdentityFailure(nodeCredentialResolution))
+        {
+            _diagnostics.RecordCredentialResolutionResult(nodeCredentialResolution);
+            _diagnostics.Record(
+                "identity",
+                "Stored device identity could not be loaded for node connection",
+                nodeCredentialResolution.Detail);
+            await _transitionSemaphore.WaitAsync(cancellationToken);
+            try
+            {
+                if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, nodeGeneration))
+                    return false;
+
+                _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+                _stateMachine.BlockNodeStart(
+                    DeviceIdentityLoadException.RecoveryMessage,
+                    preserveCredentialResolution: true);
+                EmitStateChanged();
+            }
+            finally
+            {
+                _transitionSemaphore.Release();
+            }
+
+            CompleteNodeTelemetryAttempt(
+                nodeGeneration,
+                "failure",
+                ConnectionErrorCategory.InternalError);
+            return false;
+        }
+
+        if (nodeCredential == null)
+        {
+            _logger.Warn("[ConnMgr] No node credential available — skipping node connection");
+            _diagnostics.RecordCredentialResolutionResult(nodeCredentialResolution);
+            await _transitionSemaphore.WaitAsync(cancellationToken);
+            try
+            {
+                if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, nodeGeneration))
+                    return false;
+
+                _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
+                _stateMachine.BlockNodeStart(
+                    BuildCredentialFailureMessage("node", nodeCredentialResolution),
+                    preserveCredentialResolution: true);
+                EmitStateChanged();
+            }
+            finally
+            {
+                _transitionSemaphore.Release();
+            }
+            CompleteNodeTelemetryAttempt(nodeGeneration, "failure", ConnectionErrorCategory.AuthFailure);
+            return false;
+        }
+
+        var nodeEndpointAuthorization = await AuthorizeCredentialForEndpointAsync(
+            record,
+            nodeCredential,
+            cancellationToken,
+            requireSshTunnelOwnership: true).ConfigureAwait(false);
+        var expectedNodeEndpointOwnership = nodeEndpointAuthorization.OwnershipProof;
+        if (!nodeEndpointAuthorization.Allowed)
+        {
+            _diagnostics.Record(
+                "setup",
+                "Blocked node credential before managed-local endpoint ownership was proven",
+                nodeEndpointAuthorization.Detail);
+            await BlockNodeStartAsync(
+                nodeEndpointAuthorization.Detail,
+                cancellationToken,
+                expectedLifecycleGeneration,
+                nodeGeneration);
+            CompleteNodeTelemetryAttempt(nodeGeneration, "failure", ConnectionErrorCategory.AuthFailure);
+            return false;
+        }
+
+        await _transitionSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (!IsExpectedNodeStartCurrent(expectedLifecycleGeneration, nodeGeneration))
+                return false;
+
+            _stateMachine.SetNodeCredentialSource(nodeCredential.Source);
+            _stateMachine.SetNodeCredentialResolution(nodeCredentialResolution);
         }
         finally
         {
@@ -1233,14 +3497,78 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         _diagnostics.Record("node", $"Starting node connection to {nodeConnectUrl}",
             $"Credential source: {nodeCredential.Source}");
 
+        if (_nodeConnector is INodeConnectorReconnectPolicy reconnectPolicy)
+        {
+            async Task<ReconnectAuthorizationResult> AuthorizeNodeCredentialHandoffAsync(
+                CancellationToken authorizationCancellationToken)
+            {
+                var authorization = await AuthorizeCredentialHandoffAsync(
+                        record,
+                        nodeCredential,
+                        expectedNodeEndpointOwnership,
+                        () => IsExpectedNodeStartCurrent(
+                            expectedLifecycleGeneration,
+                            nodeGeneration),
+                        cancellationToken,
+                        authorizationCancellationToken,
+                        "node")
+                    .ConfigureAwait(false);
+                if (!authorization.Allowed &&
+                    authorization.FailureKind != GatewayErrorKind.Unknown)
+                {
+                    await BlockNodeStartAsync(
+                            authorization.Detail ?? "Node credential handoff was not authorized.",
+                            authorizationCancellationToken,
+                            expectedLifecycleGeneration,
+                            nodeGeneration)
+                        .ConfigureAwait(false);
+                }
+                return authorization;
+            }
+
+            reconnectPolicy.HandshakeAuthorizationAsync =
+                AuthorizeNodeCredentialHandoffAsync;
+            reconnectPolicy.ReconnectAuthorizationAsync =
+                AuthorizeNodeCredentialHandoffAsync;
+        }
+
         try
         {
-            await _nodeConnector.ConnectAsync(nodeConnectUrl, nodeCredential, _activeIdentityPath,
+            await _nodeConnector.ConnectAsync(nodeConnectUrl, nodeCredential, activeIdentityPath,
                 useV2Signature: _gatewayNeedsV2Signature,
                 cancellationToken: cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            CompleteNodeTelemetryAttempt(
+                nodeGeneration,
+                "canceled",
+                ConnectionErrorCategory.Cancelled);
+            return false;
+        }
+        catch (DeviceIdentityLoadException ex)
+        {
+            if (cancellationToken.IsCancellationRequested ||
+                Interlocked.Read(ref _nodeConnectionGeneration) != nodeGeneration)
+            {
+                return false;
+            }
+
+            var detail = BuildIdentityFailureDetail(ex);
+            _logger.Error($"[ConnMgr] Stored device identity load failed for node connection: {detail}");
+            _diagnostics.Record(
+                "identity",
+                "Stored device identity could not be loaded for node connection",
+                detail);
+            await BlockNodeStartAsync(
+                DeviceIdentityLoadException.RecoveryMessage,
+                cancellationToken,
+                expectedLifecycleGeneration,
+                nodeGeneration);
+            CompleteNodeTelemetryAttempt(
+                nodeGeneration,
+                "failure",
+                ConnectionErrorCategory.InternalError);
             return false;
         }
         catch (Exception ex)
@@ -1253,18 +3581,66 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
             _logger.Error($"[ConnMgr] Node connect failed: {ex.Message}");
             _diagnostics.Record("node", "Node connect failed", ex.Message);
+            await BlockNodeStartAsync(
+                $"Node connect failed: {ex.Message}",
+                cancellationToken,
+                expectedLifecycleGeneration,
+                nodeGeneration);
+            CompleteNodeTelemetryAttempt(nodeGeneration, "failure", ConnectionErrorCategory.NetworkUnreachable);
+            return false;
         }
 
         return !cancellationToken.IsCancellationRequested &&
             Interlocked.Read(ref _nodeConnectionGeneration) == nodeGeneration;
     }
 
-    private void OnNodeStatusChanged(object? sender, ConnectionStatus status) =>
+    private void OnNodeStatusChanged(object? sender, ConnectionStatus status)
+    {
+        var lifecycleGeneration = Interlocked.Read(ref _generation);
+        var nodeGeneration = Interlocked.Read(ref _nodeConnectionGeneration);
+        ObserveNodeTelemetryStatus(status, lifecycleGeneration, nodeGeneration);
         AsyncEventHandlerGuard.Run(
             () => OnNodeStatusChangedAsync(status),
             _logger,
             nameof(OnNodeStatusChanged),
             ex => _diagnostics.Record("node", "Node status handler failed", ex.Message));
+    }
+
+    private void OnNodeTransportConnected(object? sender, EventArgs e)
+    {
+        var lifecycleGeneration = Interlocked.Read(ref _generation);
+        var nodeGeneration = Interlocked.Read(ref _nodeConnectionGeneration);
+        if (IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+            TransitionNodeTelemetryPhase(nodeGeneration, NodeHandshakeSpanName);
+    }
+
+    private void OnNodeConnectionFailure(object? sender, GatewayErrorKind errorKind)
+    {
+        var lifecycleGeneration = Interlocked.Read(ref _generation);
+        var nodeGeneration = Interlocked.Read(ref _nodeConnectionGeneration);
+        if (!IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+            return;
+
+        lock (_nodeOperationLock)
+        {
+            Interlocked.CompareExchange(
+                ref _nodeStartLifecycleGeneration,
+                -1,
+                lifecycleGeneration);
+        }
+
+        CompleteNodeTelemetryAttempt(
+            nodeGeneration,
+            "failure",
+            MapNodeConnectionErrorCategory(errorKind));
+
+        // A stale node DEVICE token is the one node failure we can self-recover: clear only the
+        // node device token and reconnect with the still-valid shared/bootstrap credential. Queue
+        // it off this handler — it is invoked under the connector's client-lifecycle lock, which
+        // requires prompt, non-reentrant subscribers, so the disk clear + reconnect must not run here.
+        if (errorKind == GatewayErrorKind.DeviceTokenMismatch)
+            _ = Task.Run(() => HandleNodeDeviceTokenMismatchAsync(lifecycleGeneration, nodeGeneration));
+    }
 
     private void OnNodeDeviceTokenReceived(object? sender, DeviceTokenReceivedEventArgs e)
     {
@@ -1288,11 +3664,11 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
         await _transitionSemaphore.WaitAsync();
         try
         {
-            var prev = _stateMachine.Current.OverallState;
             switch (status)
             {
                 case ConnectionStatus.Connected:
                     _stateMachine.TryTransition(ConnectionTrigger.NodeConnected);
+                    _nodeTokenRecoveryAttemptedGatewayId = null;
                     break;
                 case ConnectionStatus.Connecting:
                     _stateMachine.StartNodeConnecting();
@@ -1303,7 +3679,11 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                     break;
                 case ConnectionStatus.Error:
                     if (_stateMachine.Current.NodeState != RoleConnectionState.PairingRequired)
-                        _stateMachine.TryTransition(ConnectionTrigger.NodeError, "Node transport error");
+                        _stateMachine.TryTransition(
+                            ConnectionTrigger.NodeError,
+                            string.IsNullOrWhiteSpace(_stateMachine.Current.NodeError)
+                                ? "Node transport error"
+                                : _stateMachine.Current.NodeError);
                     break;
             }
 
@@ -1327,7 +3707,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             }
 
             TryClearBootstrapTokenAfterDurablePairing();
-            EmitStateChanged(prev);
+            EmitStateChanged();
         }
         finally
         {
@@ -1339,6 +3719,25 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
     {
         var lifecycleGeneration = Interlocked.Read(ref _generation);
         var nodeGeneration = Interlocked.Read(ref _nodeConnectionGeneration);
+        if (e.Status == PairingStatus.Pending)
+        {
+            CompleteNodeTelemetryAttempt(
+                nodeGeneration,
+                "pairing_required",
+                ConnectionErrorCategory.PairingPending);
+        }
+        else if (e.Status == PairingStatus.Rejected)
+        {
+            CompleteNodeTelemetryAttempt(
+                nodeGeneration,
+                "pairing_rejected",
+                ConnectionErrorCategory.PairingRejected);
+        }
+        else if (e.Status == PairingStatus.Paired && _nodeConnector?.IsConnected == true)
+        {
+            CompleteNodeTelemetryAttempt(nodeGeneration, "success");
+        }
+
         AsyncEventHandlerGuard.Run(
             () => OnNodePairingStatusChangedAsync(e, lifecycleGeneration, nodeGeneration),
             _logger,
@@ -1362,11 +3761,11 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             if (!IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
                 return;
 
-            var prev = _stateMachine.Current.OverallState;
             switch (e.Status)
             {
                 case PairingStatus.Paired:
                     _stateMachine.TryTransition(ConnectionTrigger.NodePaired);
+                    _nodeTokenRecoveryAttemptedGatewayId = null;
                     Interlocked.Exchange(ref _lastAutoApprovedDevicePairRequestId, null);
                     lock (_devicePairReconnectLock)
                     {
@@ -1395,7 +3794,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             }
 
             TryClearBootstrapTokenAfterDurablePairing();
-            EmitStateChanged(prev);
+            EmitStateChanged();
         }
         finally
         {
@@ -1677,13 +4076,469 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
     // ─── Helpers ───
 
-    private void EmitStateChanged(OverallConnectionState previousOverall)
+    private void EmitStateChanged()
     {
         var snapshot = _stateMachine.Current;
+        RecordTelemetryStateTransitions(snapshot);
         // Always fire when any part of the snapshot changed — not just OverallState.
         // Node sub-state changes (e.g. Idle→PairingRequired) may not change OverallState
         // but the UI still needs to update.
         StateChanged?.Invoke(this, snapshot);
+    }
+
+    private void StartOperatorTelemetryAttempt(string operation, long generation)
+    {
+        var tags = new[]
+        {
+            OpenClawTelemetryTag.String(RoleTag, "operator"),
+            OpenClawTelemetryTag.String(OperationTag, operation),
+            OpenClawTelemetryTag.String(OpenClawTelemetryTagKey.Source, "gateway_connection")
+        };
+        var rootActivity = OpenClawTelemetry.StartDetachedActivity(
+            operation == "connect" ? OperatorConnectSpanName : OperatorReconnectSpanName,
+            tags);
+        var attempt = new TelemetryAttempt(
+            generation,
+            operation,
+            Stopwatch.GetTimestamp(),
+            rootActivity)
+        {
+            PhaseActivity = rootActivity == null
+                ? null
+                : OpenClawTelemetry.StartDetachedActivity(
+                    OperatorPrepareSpanName,
+                    rootActivity.Context,
+                    tags)
+        };
+        TelemetryAttempt? superseded;
+
+        lock (_telemetryLock)
+        {
+            superseded = _operatorTelemetryAttempt;
+            _operatorTelemetryAttempt = attempt;
+        }
+
+        if (superseded != null)
+            FinishConnectionTelemetryAttempt(superseded, "operator", "superseded", null);
+        OpenClawTelemetry.Add(ConnectionAttempts, tags: tags);
+    }
+
+    private void TransitionOperatorTelemetryPhase(long generation, string spanName)
+    {
+        TelemetryAttempt attempt;
+        Activity? previousPhase;
+        ActivityContext parentContext;
+        string operation;
+        long phaseGeneration;
+
+        lock (_telemetryLock)
+        {
+            if (_operatorTelemetryAttempt is not { } active ||
+                active.Generation != generation ||
+                active.Activity == null)
+            {
+                return;
+            }
+
+            attempt = active;
+            previousPhase = attempt.PhaseActivity;
+            attempt.PhaseActivity = null;
+            phaseGeneration = ++attempt.PhaseGeneration;
+            parentContext = attempt.Activity.Context;
+            operation = attempt.Operation;
+        }
+
+        FinishTelemetryActivity(previousPhase, "success", null);
+        var nextPhase = OpenClawTelemetry.StartDetachedActivity(
+            spanName,
+            parentContext,
+            [
+                OpenClawTelemetryTag.String(RoleTag, "operator"),
+                OpenClawTelemetryTag.String(OperationTag, operation),
+                OpenClawTelemetryTag.String(OpenClawTelemetryTagKey.Source, "gateway_connection")
+            ]);
+
+        var accepted = false;
+        lock (_telemetryLock)
+        {
+            if (ReferenceEquals(_operatorTelemetryAttempt, attempt) &&
+                attempt.PhaseGeneration == phaseGeneration)
+            {
+                attempt.PhaseActivity = nextPhase;
+                accepted = true;
+            }
+        }
+
+        if (!accepted)
+            FinishTelemetryActivity(nextPhase, "superseded", null);
+    }
+
+    private void CompleteOperatorTelemetryAttempt(
+        long generation,
+        string outcome,
+        ConnectionErrorCategory? errorCategory = null)
+    {
+        TelemetryAttempt? attempt;
+        lock (_telemetryLock)
+        {
+            if (_operatorTelemetryAttempt is not { } active ||
+                active.Generation != generation)
+                return;
+
+            attempt = active;
+            _operatorTelemetryAttempt = null;
+        }
+
+        FinishConnectionTelemetryAttempt(attempt, "operator", outcome, errorCategory);
+    }
+
+    private void CancelOperatorTelemetryAttempt(
+        string outcome,
+        ConnectionErrorCategory? errorCategory)
+    {
+        TelemetryAttempt? attempt;
+        lock (_telemetryLock)
+        {
+            attempt = _operatorTelemetryAttempt;
+            _operatorTelemetryAttempt = null;
+        }
+
+        if (attempt != null)
+            FinishConnectionTelemetryAttempt(attempt, "operator", outcome, errorCategory);
+    }
+
+    private void ObserveNodeTelemetryStatus(
+        ConnectionStatus status,
+        long lifecycleGeneration,
+        long nodeGeneration)
+    {
+        if (!IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+            return;
+
+        switch (status)
+        {
+            case ConnectionStatus.Connecting:
+                if (!TransitionNodeTelemetryPhase(nodeGeneration, NodeTransportSpanName))
+                {
+                    StartNodeTelemetryAttempt(
+                        lifecycleGeneration,
+                        nodeGeneration,
+                        "reconnect",
+                        NodeTransportSpanName);
+                }
+                break;
+            case ConnectionStatus.Connected when _nodeConnector?.PairingStatus == PairingStatus.Paired:
+                CompleteNodeTelemetryAttempt(nodeGeneration, "success");
+                break;
+            case ConnectionStatus.Disconnected:
+                // Pairing and classified gateway failures complete through their richer
+                // events first. Disconnected has no reason payload and covers both orderly
+                // remote closes and premature transport loss, so server_close is the
+                // existing finite fallback rather than a claim about the underlying cause.
+                CompleteNodeTelemetryAttempt(
+                    nodeGeneration,
+                    "failure",
+                    ConnectionErrorCategory.ServerClose);
+                break;
+            case ConnectionStatus.Error:
+                CompleteNodeTelemetryAttempt(
+                    nodeGeneration,
+                    "failure",
+                    ConnectionErrorCategory.NetworkUnreachable);
+                break;
+        }
+    }
+
+    private void StartNodeTelemetryAttempt(
+        long lifecycleGeneration,
+        long nodeGeneration,
+        string operation,
+        string initialPhaseSpanName)
+    {
+        if (!IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+            return;
+
+        var tags = new[]
+        {
+            OpenClawTelemetryTag.String(RoleTag, "node"),
+            OpenClawTelemetryTag.String(OperationTag, operation),
+            OpenClawTelemetryTag.String(OpenClawTelemetryTagKey.Source, "gateway_connection")
+        };
+        var rootActivity = OpenClawTelemetry.StartDetachedActivity(
+            operation == "connect" ? NodeConnectSpanName : NodeReconnectSpanName,
+            tags);
+        var attempt = new TelemetryAttempt(
+            nodeGeneration,
+            operation,
+            Stopwatch.GetTimestamp(),
+            rootActivity)
+        {
+            PhaseActivity = rootActivity == null
+                ? null
+                : OpenClawTelemetry.StartDetachedActivity(
+                    initialPhaseSpanName,
+                    rootActivity.Context,
+                    tags),
+            PhaseName = initialPhaseSpanName
+        };
+        TelemetryAttempt? superseded = null;
+        var accepted = false;
+
+        lock (_telemetryLock)
+        {
+            if (IsCurrentNodeAttempt(lifecycleGeneration, nodeGeneration))
+            {
+                superseded = _nodeTelemetryAttempt;
+                _nodeTelemetryAttempt = attempt;
+                accepted = true;
+            }
+        }
+
+        if (!accepted)
+        {
+            OpenClawTelemetry.Add(ConnectionAttempts, tags: tags);
+            FinishConnectionTelemetryAttempt(attempt, "node", "superseded", null);
+            return;
+        }
+
+        if (superseded != null)
+            FinishConnectionTelemetryAttempt(superseded, "node", "superseded", null);
+        OpenClawTelemetry.Add(ConnectionAttempts, tags: tags);
+    }
+
+    private static void RecordNodePreflightTelemetryFailure(ConnectionErrorCategory errorCategory)
+    {
+        var tags = new[]
+        {
+            OpenClawTelemetryTag.String(RoleTag, "node"),
+            OpenClawTelemetryTag.String(OperationTag, "connect"),
+            OpenClawTelemetryTag.String(OpenClawTelemetryTagKey.Source, "gateway_connection")
+        };
+        var rootActivity = OpenClawTelemetry.StartDetachedActivity(NodeConnectSpanName, tags);
+        var attempt = new TelemetryAttempt(
+            Generation: 0,
+            Operation: "connect",
+            StartTimestamp: Stopwatch.GetTimestamp(),
+            Activity: rootActivity)
+        {
+            PhaseActivity = rootActivity == null
+                ? null
+                : OpenClawTelemetry.StartDetachedActivity(
+                    NodePrepareSpanName,
+                    rootActivity.Context,
+                    tags)
+        };
+
+        OpenClawTelemetry.Add(ConnectionAttempts, tags: tags);
+        FinishConnectionTelemetryAttempt(attempt, "node", "failure", errorCategory);
+    }
+
+    private bool TransitionNodeTelemetryPhase(long nodeGeneration, string spanName)
+    {
+        TelemetryAttempt attempt;
+        Activity? previousPhase;
+        ActivityContext parentContext;
+        string operation;
+        long phaseGeneration;
+
+        lock (_telemetryLock)
+        {
+            if (_nodeTelemetryAttempt is not { } active ||
+                active.Generation != nodeGeneration)
+            {
+                return false;
+            }
+
+            if (active.PhaseName == spanName)
+                return true;
+
+            if (active.Activity == null)
+            {
+                active.PhaseName = spanName;
+                return true;
+            }
+
+            attempt = active;
+            previousPhase = attempt.PhaseActivity;
+            attempt.PhaseActivity = null;
+            attempt.PhaseName = null;
+            phaseGeneration = ++attempt.PhaseGeneration;
+            parentContext = attempt.Activity.Context;
+            operation = attempt.Operation;
+        }
+
+        FinishTelemetryActivity(previousPhase, "success", null);
+        var nextPhase = OpenClawTelemetry.StartDetachedActivity(
+            spanName,
+            parentContext,
+            [
+                OpenClawTelemetryTag.String(RoleTag, "node"),
+                OpenClawTelemetryTag.String(OperationTag, operation),
+                OpenClawTelemetryTag.String(OpenClawTelemetryTagKey.Source, "gateway_connection")
+            ]);
+
+        var accepted = false;
+        lock (_telemetryLock)
+        {
+            if (ReferenceEquals(_nodeTelemetryAttempt, attempt) &&
+                attempt.PhaseGeneration == phaseGeneration)
+            {
+                attempt.PhaseActivity = nextPhase;
+                attempt.PhaseName = spanName;
+                accepted = true;
+            }
+        }
+
+        if (!accepted)
+            FinishTelemetryActivity(nextPhase, "superseded", null);
+        return true;
+    }
+
+    private void CompleteNodeTelemetryAttempt(
+        long nodeGeneration,
+        string outcome,
+        ConnectionErrorCategory? errorCategory = null)
+    {
+        TelemetryAttempt? attempt;
+        lock (_telemetryLock)
+        {
+            if (_nodeTelemetryAttempt is not { } active ||
+                active.Generation != nodeGeneration)
+            {
+                return;
+            }
+
+            attempt = active;
+            _nodeTelemetryAttempt = null;
+        }
+
+        FinishConnectionTelemetryAttempt(attempt, "node", outcome, errorCategory);
+    }
+
+    private void CancelNodeTelemetryAttempt(
+        string outcome,
+        ConnectionErrorCategory? errorCategory)
+    {
+        TelemetryAttempt? attempt;
+        lock (_telemetryLock)
+        {
+            attempt = _nodeTelemetryAttempt;
+            _nodeTelemetryAttempt = null;
+        }
+
+        if (attempt != null)
+            FinishConnectionTelemetryAttempt(attempt, "node", outcome, errorCategory);
+    }
+
+    private static ConnectionErrorCategory MapNodeConnectionErrorCategory(GatewayErrorKind errorKind) =>
+        errorKind switch
+        {
+            GatewayErrorKind.Auth or
+            GatewayErrorKind.TokenDrift or
+            GatewayErrorKind.DeviceTokenMismatch or
+            GatewayErrorKind.ScopeMismatch => ConnectionErrorCategory.AuthFailure,
+            GatewayErrorKind.PairingRequired => ConnectionErrorCategory.PairingPending,
+            GatewayErrorKind.PairingRejected => ConnectionErrorCategory.PairingRejected,
+            GatewayErrorKind.RateLimited => ConnectionErrorCategory.RateLimited,
+            GatewayErrorKind.Tunnel => ConnectionErrorCategory.SshTunnelFailure,
+            GatewayErrorKind.Network or
+            GatewayErrorKind.Tls => ConnectionErrorCategory.NetworkUnreachable,
+            GatewayErrorKind.Server => ConnectionErrorCategory.ServerClose,
+            _ => ConnectionErrorCategory.ProtocolMismatch
+        };
+
+    private static void FinishConnectionTelemetryAttempt(
+        TelemetryAttempt attempt,
+        string role,
+        string outcome,
+        ConnectionErrorCategory? errorCategory)
+    {
+        var tags = new List<OpenClawTelemetryTag>
+        {
+            OpenClawTelemetryTag.String(RoleTag, role),
+            OpenClawTelemetryTag.String(OperationTag, attempt.Operation),
+            OpenClawTelemetryTag.String(OpenClawTelemetryTagKey.Outcome, outcome)
+        };
+        if (errorCategory.HasValue)
+        {
+            tags.Add(OpenClawTelemetryTag.String(
+                OpenClawTelemetryTagKey.ErrorCategory,
+                errorCategory.Value.ToString().ToLowerInvariant()));
+        }
+        FinishTelemetryActivity(attempt.PhaseActivity, outcome, errorCategory);
+        FinishTelemetryActivity(attempt.Activity, outcome, errorCategory, tags);
+
+        OpenClawTelemetry.Record(
+            ConnectionAttemptDuration,
+            Stopwatch.GetElapsedTime(attempt.StartTimestamp).TotalMilliseconds,
+            tags);
+    }
+
+    private static void FinishTelemetryActivity(
+        Activity? activity,
+        string outcome,
+        ConnectionErrorCategory? errorCategory,
+        IEnumerable<OpenClawTelemetryTag>? tags = null)
+    {
+        if (activity == null)
+            return;
+
+        if (tags != null)
+        {
+            foreach (var tag in tags)
+                activity.SetTag(tag.Key, tag.Value);
+        }
+        else
+        {
+            activity.SetTag(OpenClawTelemetryTagKey.Outcome.ToTelemetryName(), outcome);
+            if (errorCategory.HasValue)
+            {
+                activity.SetTag(
+                    OpenClawTelemetryTagKey.ErrorCategory.ToTelemetryName(),
+                    errorCategory.Value.ToString().ToLowerInvariant());
+            }
+        }
+
+        activity.SetStatus(
+            outcome is "failure" or "pairing_rejected"
+                ? ActivityStatusCode.Error
+                : outcome == "success"
+                    ? ActivityStatusCode.Ok
+                    : ActivityStatusCode.Unset);
+        OpenClawTelemetry.StopDetachedActivity(activity);
+    }
+
+    private void RecordTelemetryStateTransitions(GatewayConnectionSnapshot snapshot)
+    {
+        GatewayConnectionSnapshot previous;
+        lock (_telemetryLock)
+        {
+            previous = _lastTelemetrySnapshot;
+            _lastTelemetrySnapshot = snapshot;
+        }
+
+        RecordTelemetryStateTransition("operator", previous.OperatorState, snapshot.OperatorState);
+        RecordTelemetryStateTransition("node", previous.NodeState, snapshot.NodeState);
+        RecordTelemetryStateTransition("overall", previous.OverallState, snapshot.OverallState);
+    }
+
+    private static void RecordTelemetryStateTransition<TState>(
+        string scope,
+        TState from,
+        TState to)
+        where TState : struct, Enum
+    {
+        if (EqualityComparer<TState>.Default.Equals(from, to))
+            return;
+
+        OpenClawTelemetry.Add(
+            ConnectionStateTransitions,
+            tags:
+            [
+                OpenClawTelemetryTag.String(StateScopeTag, scope),
+                OpenClawTelemetryTag.String(StateFromTag, from.ToString().ToLowerInvariant()),
+                OpenClawTelemetryTag.String(StateToTag, to.ToString().ToLowerInvariant())
+            ]);
     }
 
     private async Task DisposeActiveClientAsync()
@@ -1704,6 +4559,7 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
 
             lock (_nodeOperationLock)
                 Interlocked.Increment(ref _nodeConnectionGeneration);
+            CancelNodeTelemetryAttempt("canceled", ConnectionErrorCategory.Cancelled);
         }
         finally
         {
@@ -1785,6 +4641,10 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
     {
         if (_disposed) return;
         _disposed = true;
+        CancelOperatorTelemetryAttempt("disposed", ConnectionErrorCategory.Disposed);
+        CancelNodeTelemetryAttempt("disposed", ConnectionErrorCategory.Disposed);
+        try { Volatile.Read(ref _manualSshRestartCts)?.Cancel(); }
+        catch (ObjectDisposedException) { }
         _operationCts?.Cancel();
 
         // Unsubscribe from node events before disposing the semaphore
@@ -1794,6 +4654,11 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
             _nodeConnector.StatusChanged -= OnNodeStatusChanged;
             _nodeConnector.PairingStatusChanged -= OnNodePairingStatusChanged;
             _nodeConnector.DeviceTokenReceived -= OnNodeDeviceTokenReceived;
+            if (_nodeConnector is INodeConnectorTelemetryEvents telemetryEvents)
+            {
+                telemetryEvents.TransportConnected -= OnNodeTransportConnected;
+                telemetryEvents.ConnectionFailure -= OnNodeConnectionFailure;
+            }
         }
         // Acquire semaphore briefly to ensure no in-flight reconnect/switch is mid-transition.
         // Use a short timeout — if something is stuck, proceed with disposal anyway,
@@ -1832,8 +4697,35 @@ public sealed class GatewayConnectionManager : IGatewayConnectionManager
                 _transitionSemaphore.Dispose();
             }
 
+            // slopwatch-ignore: SW003 Best-effort disposal of the lifecycle lease; failure cannot improve caller state.
+            try { _gatewayLifecycleLease.Dispose(); }
+            catch (Exception ex) { _logger.Debug($"[ConnMgr] Dispose: lifecycle lease dispose failed: {ex.Message}"); }
+
             GC.SuppressFinalize(this);
         }
+    }
+
+    private sealed record TelemetryAttempt(
+        long Generation,
+        string Operation,
+        long StartTimestamp,
+        Activity? Activity)
+    {
+        public Activity? PhaseActivity { get; set; }
+        public string? PhaseName { get; set; }
+        public long PhaseGeneration { get; set; }
+    }
+
+    private sealed class NodeStartGuardLease
+    {
+        public long? Version { get; set; }
+    }
+
+    private long AcquireNodeStartGuard(long lifecycleGeneration)
+    {
+        var version = Interlocked.Increment(ref _nodeStartGuardVersion);
+        Interlocked.Exchange(ref _nodeStartLifecycleGeneration, lifecycleGeneration);
+        return version;
     }
 
     private void ObserveBackgroundFault(Task task, string message)

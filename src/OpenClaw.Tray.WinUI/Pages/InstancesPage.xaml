@@ -6,20 +6,6 @@
     <Grid HorizontalAlignment="Stretch">
         <StackPanel Padding="24" Spacing="16" HorizontalAlignment="Stretch" MaxWidth="900">
 
-            <!-- Inline back link — only shown when the user arrived via a
-                 cross-page link from Connection. Set by InstancesPage.Initialize
-                 based on HubWindow.LastNavigationOrigin. -->
-            <HyperlinkButton x:Name="BackToConnectionLink"
-                             Click="OnBackToConnectionClicked"
-                             Padding="0" Margin="0,0,0,-8"
-                             Visibility="Collapsed"
-                             AutomationProperties.AutomationId="BackToConnectionLink">
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <FontIcon Glyph="&#xE72B;" FontSize="12"/>
-                    <TextBlock x:Uid="InstancesPage_BackToConnectionText" Text="Back to Connection"/>
-                </StackPanel>
-            </HyperlinkButton>
-
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
@@ -28,6 +14,7 @@
                 <StackPanel Grid.Column="0" Spacing="4">
                     <TextBlock x:Uid="InstancesPage_Title"
                                Text="Instances"
+                               AutomationProperties.AutomationId="InstancesPageMarker"
                                Style="{StaticResource TitleTextBlockStyle}"/>
                     <TextBlock x:Uid="InstancesPage_Subtitle"
                                Text="Latest presence beacons from OpenClaw nodes."
@@ -38,6 +25,7 @@
                 <Button x:Name="RefreshButton"
                         Grid.Column="1"
                         Click="OnRefreshClicked"
+                        AutomationProperties.LabeledBy="{Binding ElementName=RefreshButtonLabel}"
                         VerticalAlignment="Top">
                     <StackPanel Orientation="Horizontal" Spacing="6">
                         <Grid Width="14" Height="14">
@@ -50,7 +38,7 @@
                                           Height="14"
                                           Visibility="Collapsed"/>
                         </Grid>
-                        <TextBlock x:Uid="InstancesPage_RefreshLabel" Text="Refresh"/>
+                        <TextBlock x:Uid="InstancesPage_RefreshLabel" x:Name="RefreshButtonLabel" Text="Refresh"/>
                     </StackPanel>
                 </Button>
             </Grid>

@@ -26,7 +26,4 @@ internal static class GatewayNavVisibilityDebouncePolicy
 
     public static bool ShouldHideAfterDelay(ConnectionStatus status) =>
         status != ConnectionStatus.Connected;
-
-    public static bool ShouldKeepCurrentPageVisibleDuringDisconnect(string? currentTag) =>
-        string.Equals(currentTag, "config", StringComparison.OrdinalIgnoreCase);
 }

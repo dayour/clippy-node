@@ -21,7 +21,11 @@ public abstract class SetupStep
 
 public enum PipelineOutcome { Success, Failed, Cancelled }
 
-public sealed record PipelineResult(PipelineOutcome Outcome, string? FailedStepId = null, string? Message = null)
+public sealed record PipelineResult(
+    PipelineOutcome Outcome,
+    string? FailedStepId = null,
+    string? Message = null,
+    GatewayCompatibilityFailureKind? CompatibilityFailure = null)
 {
     public int ExitCode => Outcome switch
     {
@@ -38,12 +42,20 @@ public sealed record StepProgressEvent(string StepId, string DisplayName, StepOu
 
 public static class SetupStepFactory
 {
+    public static List<SetupStep> BuildWizardOnlySteps() =>
+    [
+        new RunGatewayWizardStep(),
+        new WindowsNodeBootstrapContextStep(),
+    ];
+
     public static List<SetupStep> BuildDefaultSteps()
     {
         return
         [
+            new ValidateDistroInstallPathStep(),
             new PreflightOsStep(),
             new PreflightWslStep(),
+            new PreflightWindowsTailscaleStep(),
             new CleanupStaleDistroStep(),
             new CleanupStaleGatewayStep(),
             new PreflightPortStep(),
@@ -51,14 +63,18 @@ public static class SetupStepFactory
             new ConfigureWslInstanceStep(),
             new ValidateWslLockdownStep(),
             new InstallCliStep(),
+            new InstallTailscaleStep(),
+            new AuthorizeTailscaleStep(),
             new ConfigureGatewayStep(),
             new InstallGatewayServiceStep(),
             new StartGatewayStep(),
+            new FinalizeTailscaleServeStep(),
             new MintBootstrapTokenStep(),
             new PairOperatorStep(),
             new PairNodeStep(),
             new VerifyEndToEndStep(),
             new RunGatewayWizardStep(),
+            new WindowsNodeBootstrapContextStep(),
             new StartKeepaliveStep(),
         ];
     }
@@ -70,13 +86,22 @@ public sealed class SetupPipeline
 {
     private readonly List<SetupStep> _steps;
     private readonly List<SetupStep> _completedSteps = new();
+    private readonly bool? _rollbackOnFailureOverride;
 
     public event EventHandler<StepProgressEvent>? StepProgress;
 
-    public SetupPipeline(IEnumerable<SetupStep> steps)
+    public SetupPipeline(IEnumerable<SetupStep> steps, bool? rollbackOnFailureOverride = null)
     {
         _steps = steps.ToList();
+        _rollbackOnFailureOverride = rollbackOnFailureOverride;
     }
+
+    internal static bool ShouldRunTrayArtifactCleanup(PipelineResult result, bool dryRun)
+        => !dryRun &&
+           !string.Equals(
+               result.FailedStepId,
+               ValidateDistroInstallPathStep.StepId,
+               StringComparison.Ordinal);
 
     public async Task<PipelineResult> RunAsync(SetupContext ctx)
     {
@@ -168,14 +193,18 @@ public sealed class SetupPipeline
             else
                 ctx.Logger.Warn($"SetupPipeline: Step '{step.Id}' failed: {result.Message}");
 
-            if (ctx.Config.RollbackOnFailure)
+            if (_rollbackOnFailureOverride ?? ctx.Config.RollbackOnFailure)
             {
                 await RollbackFailedStep(step, ctx);
                 await RollbackCompletedSteps(ctx);
             }
 
             ctx.Journal.RecordPipelineEvent("pipeline_failed", $"step={step.Id}, message={result.Message}");
-            return new PipelineResult(PipelineOutcome.Failed, step.Id, result.Message);
+            return new PipelineResult(
+                PipelineOutcome.Failed,
+                step.Id,
+                result.Message,
+                (result.Error as GatewayCompatibilityException)?.Kind);
         }
 
         pipelineSw.Stop();
@@ -237,6 +266,19 @@ public sealed class SetupPipeline
     {
         _completedSteps.Clear();
         var ct = ctx.CancellationToken;
+
+        if (!DistroInstallPathPolicy.TryGetManagedInstallPath(
+                ctx.LocalDataDir,
+                ctx.DistroName,
+                out _,
+                out var pathError))
+        {
+            ctx.Logger.Error($"Uninstall refused unsafe WSL distro path: {pathError}");
+            return new PipelineResult(
+                PipelineOutcome.Failed,
+                FailedStepId: ValidateDistroInstallPathStep.StepId,
+                Message: pathError);
+        }
 
         if (!ctx.Config.ConfirmDestructive && !ctx.Config.DryRun)
         {

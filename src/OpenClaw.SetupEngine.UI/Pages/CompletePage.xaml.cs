@@ -17,7 +17,6 @@ public sealed partial class CompletePage : Page
     public CompletePage()
     {
         InitializeComponent();
-        Loaded += OnLoaded;
     }
 
     protected override void OnNavigatedTo(NavigationEventArgs e)
@@ -30,10 +29,15 @@ public sealed partial class CompletePage : Page
             {
                 SuccessIcon.Visibility = Visibility.Visible;
                 FailureIcon.Visibility = Visibility.Collapsed;
+                StartupToggle.IsOn = args.DefaultAutoStart;
+                StartupRow.Visibility = args.ShowStartupPreference ? Visibility.Visible : Visibility.Collapsed;
+                GatewaySummaryText.Text = (args.ReviewSummary ?? SetupReviewSummaryBuilder.Build(new SetupConfig())).CompletionGatewaySummary;
                 TitleText.Text = "All set!";
                 SubtitleText.Text = "OpenClaw is ready to go";
                 ErrorCard.Visibility = Visibility.Collapsed;
                 HelpLink.Visibility = Visibility.Collapsed;
+                FallbackButton.Visibility = Visibility.Collapsed;
+                SummaryPanel.Visibility = Visibility.Visible;
             }
             else
             {
@@ -48,7 +52,14 @@ public sealed partial class CompletePage : Page
                     : "Follow the steps below to resolve the setup issue and retry.";
                 NodeModeBanner.Visibility = Visibility.Collapsed;
                 StartupRow.Visibility = Visibility.Collapsed;
+                SummaryPanel.Visibility = Visibility.Collapsed;
                 LaunchButton.Content = "Close";
+                FallbackButton.Visibility = args.CanRetryGatewayFallback
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+                FallbackButton.Content = string.IsNullOrWhiteSpace(args.GatewayFallbackVersion)
+                    ? "Retry with validated fallback"
+                    : $"Retry with validated fallback {args.GatewayFallbackVersion}";
 
                 // Show error card with details and log link
                 ErrorCard.Visibility = Visibility.Visible;
@@ -90,23 +101,11 @@ public sealed partial class CompletePage : Page
         return Uri.TryCreate(match.Value, UriKind.Absolute, out var uri) ? uri : null;
     }
 
-    private void OnLoaded(object sender, RoutedEventArgs e)
-    {
-        // Style the Node Mode banner with amber/brown background
-        var isDark = ActualTheme == ElementTheme.Dark;
-        NodeModeBanner.Background = new SolidColorBrush(isDark
-            ? Color.FromArgb(255, 0x4A, 0x3D, 0x10) // dark amber
-            : Color.FromArgb(255, 0xF5, 0xE6, 0xB8)); // light amber
-
-        // Default startup toggle to off (user can enable)
-        StartupToggle.IsOn = false;
-    }
-
     private void LaunchButton_Click(object sender, RoutedEventArgs e)
     {
         if (LaunchButton.Content?.ToString() != "Close")
         {
-            var enableAutoStart = StartupToggle.Visibility == Visibility.Visible && StartupToggle.IsOn;
+            var enableAutoStart = StartupRow.Visibility == Visibility.Visible && StartupToggle.IsOn;
             if (SetupWindow.Active?.RequestSetupCompleted(enableAutoStart) == true)
                 return;
         }
@@ -117,6 +116,20 @@ public sealed partial class CompletePage : Page
     private void ViewLog_Click(object sender, RoutedEventArgs e)
     {
         LogFileLauncher.RevealInExplorer(_logPath);
+    }
+
+    private void FallbackButton_Click(object sender, RoutedEventArgs e)
+    {
+        string? error = null;
+        if (SetupWindow.Active is { } window &&
+            window.TryRetryWithGatewayFallback(out error))
+        {
+            return;
+        }
+
+        FallbackButton.Visibility = Visibility.Collapsed;
+        if (!string.IsNullOrWhiteSpace(error))
+            ErrorText.Text = $"{ErrorText.Text}{Environment.NewLine}{error}";
     }
 
 }

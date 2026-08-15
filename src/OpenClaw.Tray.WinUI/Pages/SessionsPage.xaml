@@ -8,27 +8,11 @@
     <ScrollViewer VerticalScrollBarVisibility="Auto">
         <Grid HorizontalAlignment="Stretch">
             <StackPanel Padding="24" Spacing="12"
-                        HorizontalAlignment="Stretch" MaxWidth="900">
+                    HorizontalAlignment="Stretch" MaxWidth="900">
 
-                <!-- Shown only when the user arrived via Connection's cross-page link. -->
-                <HyperlinkButton x:Name="BackToConnectionLink"
-                                 Click="OnBackToConnectionClicked"
-                                 Padding="0" Margin="0,0,0,4"
-                                 Visibility="Collapsed"
-                                 AutomationProperties.AutomationId="BackToConnectionLink">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <FontIcon Glyph="&#xE72B;"
-                                  FontFamily="{ThemeResource SymbolThemeFontFamily}"
-                                  FontSize="12"
-                                  IsTextScaleFactorEnabled="False"/>
-                        <TextBlock x:Uid="SessionsPage_BackToConnection"
-                                   Text="Back to Connection"
-                                   Style="{StaticResource CaptionTextBlockStyle}"/>
-                    </StackPanel>
-                </HyperlinkButton>
-
-                <TextBlock x:Uid="SessionsPage_Sessions"
+            <TextBlock x:Uid="SessionsPage_Sessions"
                            Text="Sessions"
+                           AutomationProperties.AutomationId="SessionsPageMarker"
                            Style="{StaticResource TitleTextBlockStyle}"
                            Margin="0,0,0,2"/>
                 <TextBlock x:Uid="SessionsPage_Subtitle" Text="Conversations this gateway is currently handling, grouped by channel."
@@ -40,6 +24,8 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
 
                     <SelectorBar x:Name="ChannelSelector" Grid.Column="0"
@@ -48,7 +34,21 @@
                         <SelectorBarItem x:Uid="SessionsPage_All" x:Name="AllTab" Text="All" IsSelected="True"/>
                     </SelectorBar>
 
-                    <Button x:Name="RefreshButton" Grid.Column="1"
+                    <ToggleSwitch x:Uid="SessionsPage_ShowCompleted" x:Name="ShowCompletedToggle" Grid.Column="1"
+                                  Header="Show completed"
+                                  MinWidth="0"
+                                  OnContent="" OffContent=""
+                                  Toggled="OnShowCompletedToggled"
+                                  AutomationProperties.AutomationId="SessionsPageShowCompleted"/>
+
+                    <ToggleSwitch x:Uid="SessionsPage_ShowBackground" x:Name="ShowBackgroundToggle" Grid.Column="2"
+                                  Header="Show background"
+                                  MinWidth="0"
+                                  OnContent="" OffContent=""
+                                  Toggled="OnShowBackgroundToggled"
+                                  AutomationProperties.AutomationId="SessionsPageShowBackground"/>
+
+                    <Button x:Name="RefreshButton" Grid.Column="3"
                             Click="OnRefresh"
                             ToolTipService.ToolTip="Refresh sessions"
                             AutomationProperties.Name="Refresh sessions">
@@ -97,7 +97,7 @@
                                   HorizontalAlignment="Center"
                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"/>
                         <TextBlock x:Uid="SessionsPage_NoActiveSessions"
-                                   Text="No active sessions"
+                                   Text="No sessions"
                                    Style="{StaticResource BodyStrongTextBlockStyle}"
                                    HorizontalAlignment="Center"/>
                         <TextBlock x:Uid="SessionsPage_EmptyHint" Text="Sessions appear here when a channel is connected and traffic is flowing."
@@ -142,6 +142,10 @@
                                                      VerticalAlignment="Center"
                                                      Fill="{Binding StatusBrush}"
                                                      ToolTipService.ToolTip="{Binding StatusTooltip}"/>
+                                            <TextBlock Text="{Binding StatusText}"
+                                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
                                             <TextBlock Text="{Binding DisplayName}"
                                                        Style="{StaticResource BodyStrongTextBlockStyle}"
                                                        TextTrimming="CharacterEllipsis"
@@ -220,11 +224,34 @@
                                                                           IsTextScaleFactorEnabled="False"/>
                                                             </MenuFlyoutItem.Icon>
                                                         </MenuFlyoutItem>
+                                                        <MenuFlyoutItem x:Uid="SessionsPage_Checkpoints"
+                                                                        Text="Checkpoints"
+                                                                        Tag="{Binding Key}"
+                                                                        Click="OnShowCheckpoints"
+                                                                        ToolTipService.ToolTip="View, branch or restore compaction checkpoints">
+                                                            <MenuFlyoutItem.Icon>
+                                                                <FontIcon Glyph="&#xE81C;"
+                                                                          FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                                                          IsTextScaleFactorEnabled="False"/>
+                                                            </MenuFlyoutItem.Icon>
+                                                        </MenuFlyoutItem>
+                                                        <MenuFlyoutItem x:Uid="SessionsPage_ExportTranscript"
+                                                                        Text="Export transcript"
+                                                                        Tag="{Binding Key}"
+                                                                        Click="OnExportSession"
+                                                                        ToolTipService.ToolTip="Save the conversation transcript to a text file">
+                                                            <MenuFlyoutItem.Icon>
+                                                                <FontIcon Glyph="&#xEDE1;"
+                                                                          FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                                                          IsTextScaleFactorEnabled="False"/>
+                                                            </MenuFlyoutItem.Icon>
+                                                        </MenuFlyoutItem>
                                                         <MenuFlyoutSeparator/>
                                                         <MenuFlyoutItem x:Uid="SessionsPage_Delete"
                                                                         Text="Delete"
                                                                         Tag="{Binding Key}"
                                                                         Click="OnDeleteSession"
+                                                                        IsEnabled="{Binding CanDelete}"
                                                                         Foreground="{ThemeResource SystemFillColorCriticalBrush}">
                                                             <MenuFlyoutItem.Icon>
                                                                 <FontIcon Glyph="&#xE74D;"

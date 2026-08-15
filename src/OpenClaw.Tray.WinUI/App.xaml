@@ -10,22 +10,114 @@
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
             </ResourceDictionary.MergedDictionaries>
 
-            <!-- Hub NavigationView selection indicator: follow the user's
-                 Windows accent (was hard-coded lobster red #E74C3C). Resolves
-                 against {ThemeResource SystemAccentColor} so the indicator
-                 updates if the user changes their accent. -->
+            <!-- Setup-only indicator brushes. They must live at App scope (not just in
+                 SetupWindow's element resources) because the setup pages resolve them via
+                 {ThemeResource} at page-load, before they attach to the setup window's
+                 resource scope. They alias NATIVE system resources — the active indicator
+                 follows the user's Windows accent, the inactive dot is a native neutral —
+                 so onboarding showcases the user's chosen system colors. -->
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Default">
+                    <SolidColorBrush x:Key="SetupIndicatorAccentBrush" Color="{ThemeResource SystemAccentColorLight2}" />
+                    <SolidColorBrush x:Key="SetupInactiveDotBrush" Color="{ThemeResource ControlStrongFillColorDefault}" />
+
+                    <!-- FunctionalUI resolves a brush for a target ElementTheme by walking the
+                         app-level ThemeDictionaries; the framework's XamlControlsResources
+                         brushes are not surfaced through that enumerable walk, so a control
+                         rendering dark kept the light snapshot (the composer read as light on
+                         a dark page). Re-declaring the exact framework keys here materializes
+                         them per theme with identical values (each aliases its built-in color
+                         token), so the walk flips them correctly. No hardcoded colors. -->
+                    <SolidColorBrush x:Key="SolidBackgroundFillColorBaseBrush" Color="{ThemeResource SolidBackgroundFillColorBase}" />
+                    <SolidColorBrush x:Key="ControlFillColorDefaultBrush" Color="{ThemeResource ControlFillColorDefault}" />
+                    <SolidColorBrush x:Key="ControlStrokeColorDefaultBrush" Color="{ThemeResource ControlStrokeColorDefault}" />
+                    <SolidColorBrush x:Key="SubtleFillColorSecondaryBrush" Color="{ThemeResource SubtleFillColorSecondary}" />
+                    <SolidColorBrush x:Key="SubtleFillColorTertiaryBrush" Color="{ThemeResource SubtleFillColorTertiary}" />
+                    <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="{ThemeResource TextFillColorSecondary}" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillSuccessBrush" Color="{ThemeResource SystemFillColorSuccess}" Opacity="0.14" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillCautionBrush" Color="{ThemeResource SystemFillColorCaution}" Opacity="0.14" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillCriticalBrush" Color="{ThemeResource SystemFillColorCritical}" Opacity="0.14" />
+                    <SolidColorBrush x:Key="ChatUserBubbleSelectionHighlightBrush" Color="{ThemeResource SystemAccentColorDark2}" />
+                    <x:Double x:Key="ChatAccessibleBorderThickness">1</x:Double>
+                    <x:Boolean x:Key="HubNavigationUseHighContrastIcons">False</x:Boolean>
+
+                    <!-- Composer scrim: the chat timeline dissolves into the composer dock via a
+                         vertical fade from transparent to the base surface fill. FunctionalUI
+                         resolves this as a whole brush per ElementTheme and reads it out of the
+                         visual tree, so the stops use LITERAL colors (a {ThemeResource} color
+                         would re-resolve against the ambient app theme and read light on a dark
+                         page). The values mirror SolidBackgroundFillColorBase (dark #202020) so
+                         the fade lands seamlessly on the dock. -->
+                    <LinearGradientBrush x:Key="ChatComposerFadeBrush" StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Offset="0" Color="#00202020" />
+                        <GradientStop Offset="1" Color="#FF202020" />
+                    </LinearGradientBrush>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="SetupIndicatorAccentBrush" Color="{ThemeResource SystemAccentColorDark1}" />
+                    <SolidColorBrush x:Key="SetupInactiveDotBrush" Color="{ThemeResource ControlStrongFillColorDefault}" />
+
+                    <SolidColorBrush x:Key="SolidBackgroundFillColorBaseBrush" Color="{ThemeResource SolidBackgroundFillColorBase}" />
+                    <SolidColorBrush x:Key="ControlFillColorDefaultBrush" Color="{ThemeResource ControlFillColorDefault}" />
+                    <SolidColorBrush x:Key="ControlStrokeColorDefaultBrush" Color="{ThemeResource ControlStrokeColorDefault}" />
+                    <SolidColorBrush x:Key="SubtleFillColorSecondaryBrush" Color="{ThemeResource SubtleFillColorSecondary}" />
+                    <SolidColorBrush x:Key="SubtleFillColorTertiaryBrush" Color="{ThemeResource SubtleFillColorTertiary}" />
+                    <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="{ThemeResource TextFillColorSecondary}" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillSuccessBrush" Color="{ThemeResource SystemFillColorSuccess}" Opacity="0.14" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillCautionBrush" Color="{ThemeResource SystemFillColorCaution}" Opacity="0.14" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillCriticalBrush" Color="{ThemeResource SystemFillColorCritical}" Opacity="0.14" />
+                    <SolidColorBrush x:Key="ChatUserBubbleSelectionHighlightBrush" Color="{ThemeResource SystemAccentColorDark2}" />
+                    <x:Double x:Key="ChatAccessibleBorderThickness">1</x:Double>
+                    <x:Boolean x:Key="HubNavigationUseHighContrastIcons">False</x:Boolean>
+
+                    <!-- Light mirror of ChatComposerFadeBrush (SolidBackgroundFillColorBase light #F3F3F3). -->
+                    <LinearGradientBrush x:Key="ChatComposerFadeBrush" StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Offset="0" Color="#00F3F3F3" />
+                        <GradientStop Offset="1" Color="#FFF3F3F3" />
+                    </LinearGradientBrush>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="HighContrast">
+                    <SolidColorBrush x:Key="SetupIndicatorAccentBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="SetupInactiveDotBrush" Color="{ThemeResource SystemColorGrayTextColor}" />
+
+                    <SolidColorBrush x:Key="SolidBackgroundFillColorBaseBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ControlFillColorDefaultBrush" Color="{ThemeResource SystemColorButtonFaceColor}" />
+                    <SolidColorBrush x:Key="ControlStrokeColorDefaultBrush" Color="{ThemeResource SystemColorButtonTextColor}" />
+                    <SolidColorBrush x:Key="SubtleFillColorSecondaryBrush" Color="{ThemeResource SystemColorButtonFaceColor}" />
+                    <SolidColorBrush x:Key="SubtleFillColorTertiaryBrush" Color="{ThemeResource SystemColorButtonFaceColor}" />
+                    <SolidColorBrush x:Key="TextFillColorSecondaryBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillSuccessBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillCautionBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ConnectionCapabilityPillCriticalBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ChatUserBubbleSelectionHighlightBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <x:Double x:Key="ChatAccessibleBorderThickness">2</x:Double>
+                    <x:Boolean x:Key="HubNavigationUseHighContrastIcons">True</x:Boolean>
+
+                    <!-- High-contrast follows the system window color so the scrim stays legible. -->
+                    <LinearGradientBrush x:Key="ChatComposerFadeBrush" StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Offset="0" Color="Transparent" />
+                        <GradientStop Offset="1" Color="{ThemeResource SystemColorWindowColor}" />
+                    </LinearGradientBrush>
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+
+            <Style x:Key="ChatUserBubbleSelectionStyle" TargetType="RichTextBlock">
+                <Setter Property="SelectionHighlightColor" Value="{ThemeResource ChatUserBubbleSelectionHighlightBrush}"/>
+            </Style>
+            <Style x:Key="ChatToolCardBorderStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}"/>
+                <Setter Property="BorderBrush" Value="{ThemeResource ControlStrokeColorDefaultBrush}"/>
+                <Setter Property="BorderThickness" Value="{ThemeResource ChatAccessibleBorderThickness}"/>
+            </Style>
+            <Style x:Key="ChatCompactionCardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}"/>
+                <Setter Property="BorderBrush" Value="{ThemeResource ControlStrokeColorDefaultBrush}"/>
+                <Setter Property="BorderThickness" Value="{ThemeResource ChatAccessibleBorderThickness}"/>
+            </Style>
+
+            <!-- Hub NavigationView selection indicator follows the user's Windows accent. -->
             <SolidColorBrush x:Key="NavigationViewSelectionIndicatorForeground"
                              Color="{ThemeResource SystemAccentColor}"/>
-
-            <!-- Primary action button: use the WinUI default accent fill
-                 (driven by the user's Windows accent color), not the old
-                 lobster-red brand override. Foreground and CornerRadius keep
-                 the previous app-specific values so layout stays identical. -->
-            <Style x:Key="AccentButtonStyle" TargetType="Button">
-                <Setter Property="Background" Value="{ThemeResource AccentFillColorDefaultBrush}" />
-                <Setter Property="Foreground" Value="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
-                <Setter Property="CornerRadius" Value="4" />
-            </Style>
         </ResourceDictionary>
     </Application.Resources>
 </Application>

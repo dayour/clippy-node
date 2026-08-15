@@ -50,6 +50,21 @@ public interface INodeConnector : IDisposable
     Task DisconnectAsync();
 }
 
+/// <summary>
+/// Optional telemetry milestones exposed by production node connectors.
+/// </summary>
+public interface INodeConnectorTelemetryEvents
+{
+    event EventHandler TransportConnected;
+    event EventHandler<GatewayErrorKind> ConnectionFailure;
+}
+
+public interface INodeConnectorReconnectPolicy
+{
+    Func<CancellationToken, Task<ReconnectAuthorizationResult>>? HandshakeAuthorizationAsync { get; set; }
+    Func<CancellationToken, Task<ReconnectAuthorizationResult>>? ReconnectAuthorizationAsync { get; set; }
+}
+
 public sealed class NodeClientCreatedEventArgs : EventArgs
 {
     public NodeClientCreatedEventArgs(WindowsNodeClient client, string? bearerToken)

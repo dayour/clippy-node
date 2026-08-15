@@ -56,18 +56,98 @@ public class SetupPipelineTests
     }
 
     [Fact]
+    public async Task RunAsync_CompatibilityFailure_PreservesTypedTerminalReason()
+    {
+        var compatibilityError = new GatewayCompatibilityException(
+            GatewayCompatibilityFailureKind.ProtocolMismatch,
+            "Expected protocol v4.");
+        var pipeline = new SetupPipeline([
+            new MockStep(
+                "compatibility",
+                (_, _) => Task.FromResult(
+                    StepResult.Terminal(compatibilityError.Message, compatibilityError))),
+        ]);
+
+        var result = await pipeline.RunAsync(CreateContext());
+
+        Assert.Equal(PipelineOutcome.Failed, result.Outcome);
+        Assert.Equal(GatewayCompatibilityFailureKind.ProtocolMismatch, result.CompatibilityFailure);
+    }
+
+    [Fact]
     public void BuildDefaultSteps_IncludesCurrentSetupFlow()
     {
         var steps = SetupStepFactory.BuildDefaultSteps();
 
-        Assert.Equal(18, steps.Count);
-        Assert.IsType<PreflightOsStep>(steps[0]);
-        Assert.IsType<PreflightWslStep>(steps[1]);
-        Assert.IsType<CleanupStaleDistroStep>(steps[2]);
-        Assert.IsType<CleanupStaleGatewayStep>(steps[3]);
+        Assert.Equal(24, steps.Count);
+        Assert.IsType<ValidateDistroInstallPathStep>(steps[0]);
+        Assert.IsType<PreflightOsStep>(steps[1]);
+        Assert.IsType<PreflightWslStep>(steps[2]);
+        Assert.IsType<PreflightWindowsTailscaleStep>(steps[3]);
+        Assert.IsType<CleanupStaleDistroStep>(steps[4]);
+        Assert.IsType<CleanupStaleGatewayStep>(steps[5]);
         Assert.Contains(steps, s => s is ValidateWslLockdownStep);
+        var lockdownIndex = steps.FindIndex(s => s is ValidateWslLockdownStep);
+        var cliInstallIndex = steps.FindIndex(s => s is InstallCliStep);
+        Assert.Equal(lockdownIndex + 1, cliInstallIndex);
+        Assert.IsType<InstallTailscaleStep>(steps[cliInstallIndex + 1]);
+        Assert.IsType<AuthorizeTailscaleStep>(steps[cliInstallIndex + 2]);
+        var installServiceIndex = steps.FindIndex(s => s is InstallGatewayServiceStep);
+        Assert.IsType<StartGatewayStep>(steps[installServiceIndex + 1]);
+        Assert.IsType<FinalizeTailscaleServeStep>(steps[installServiceIndex + 2]);
         Assert.Contains(steps, s => s is RunGatewayWizardStep);
+        var pairNodeIndex = steps.FindIndex(s => s is PairNodeStep);
+        Assert.IsType<VerifyEndToEndStep>(steps[pairNodeIndex + 1]);
+        var wizardIndex = steps.FindIndex(s => s is RunGatewayWizardStep);
+        Assert.IsType<WindowsNodeBootstrapContextStep>(steps[wizardIndex + 1]);
         Assert.IsType<StartKeepaliveStep>(steps[^1]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TailscaleDisabled_FreshAndReplacementPipelinesSkipOnlyTailscaleSteps(bool replacement)
+    {
+        var executed = new List<string>();
+        var config = new SetupConfig
+        {
+            CleanBeforeRun = replacement,
+            Tailscale = new TailscaleConfig { Enabled = false }
+        };
+        var ctx = CreateContext(config);
+        var baselineStepId = replacement ? "replace-gateway" : "create-gateway";
+        var pipeline = new SetupPipeline([
+            new MockStep(baselineStepId, (_, _) =>
+            {
+                executed.Add(baselineStepId);
+                return Task.FromResult(StepResult.Ok());
+            }),
+            new PreflightWindowsTailscaleStep(),
+            new InstallTailscaleStep(),
+            new AuthorizeTailscaleStep(),
+            new FinalizeTailscaleServeStep(),
+            new MockStep("pair", (_, _) =>
+            {
+                executed.Add("pair");
+                return Task.FromResult(StepResult.Ok());
+            }),
+        ]);
+
+        var result = await pipeline.RunAsync(ctx);
+
+        Assert.Equal(PipelineOutcome.Success, result.Outcome);
+        Assert.Equal([baselineStepId, "pair"], executed);
+    }
+
+    [Fact]
+    public void BuildWizardOnlySteps_FinalizesWindowsNodeContextAfterWizard()
+    {
+        var steps = SetupStepFactory.BuildWizardOnlySteps();
+
+        Assert.Collection(
+            steps,
+            step => Assert.IsType<RunGatewayWizardStep>(step),
+            step => Assert.IsType<WindowsNodeBootstrapContextStep>(step));
     }
 
     [Fact]
@@ -208,6 +288,26 @@ public class SetupPipelineTests
     }
 
     [Fact]
+    public async Task RunAsync_StepFails_WithRollbackOverrideDisabled_NoRollback()
+    {
+        var rollbackCalled = false;
+        var config = new SetupConfig { RollbackOnFailure = true };
+        var ctx = CreateContext(config);
+        var pipeline = new SetupPipeline([
+            new MockStep(
+                "refresh",
+                (_, _) => Task.FromResult(StepResult.Fail("refresh failed")),
+                (_, _) => { rollbackCalled = true; return Task.CompletedTask; }),
+        ], rollbackOnFailureOverride: false);
+
+        var result = await pipeline.RunAsync(ctx);
+
+        Assert.Equal(PipelineOutcome.Failed, result.Outcome);
+        Assert.False(rollbackCalled);
+        Assert.True(config.RollbackOnFailure);
+    }
+
+    [Fact]
     public async Task RunAsync_SkippableStep_IsSkipped()
     {
         var executed = false;
@@ -318,6 +418,57 @@ public class SetupPipelineTests
         var result = await pipeline.UninstallAsync(ctx);
 
         Assert.Equal(PipelineOutcome.Success, result.Outcome);
+    }
+
+    [Fact]
+    public async Task UninstallAsync_RejectsUnsafeDistroBeforeRollbacks()
+    {
+        var rollbackCalled = false;
+        var config = new SetupConfig
+        {
+            ConfirmDestructive = true,
+            DistroName = @"..\..",
+        };
+        var ctx = CreateContext(config);
+        var pipeline = new SetupPipeline(
+        [
+            new MockStep(
+                "unsafe",
+                (_, _) => Task.FromResult(StepResult.Ok()),
+                (_, _) =>
+                {
+                    rollbackCalled = true;
+                    return Task.CompletedTask;
+                }),
+        ]);
+
+        var result = await pipeline.UninstallAsync(ctx);
+
+        Assert.Equal(PipelineOutcome.Failed, result.Outcome);
+        Assert.Equal(ValidateDistroInstallPathStep.StepId, result.FailedStepId);
+        Assert.Contains("Invalid managed WSL distro name", result.Message);
+        Assert.False(rollbackCalled);
+        Assert.False(SetupPipeline.ShouldRunTrayArtifactCleanup(result, dryRun: false));
+    }
+
+    [Fact]
+    public void TrayArtifactCleanup_RunsOnlyAfterValidatedLiveUninstall()
+    {
+        var validationFailure = new PipelineResult(
+            PipelineOutcome.Failed,
+            ValidateDistroInstallPathStep.StepId,
+            "unsafe");
+
+        Assert.False(SetupPipeline.ShouldRunTrayArtifactCleanup(validationFailure, dryRun: false));
+        Assert.False(SetupPipeline.ShouldRunTrayArtifactCleanup(
+            new PipelineResult(PipelineOutcome.Success),
+            dryRun: true));
+        Assert.True(SetupPipeline.ShouldRunTrayArtifactCleanup(
+            new PipelineResult(PipelineOutcome.Failed, "other-step", "failed"),
+            dryRun: false));
+        Assert.True(SetupPipeline.ShouldRunTrayArtifactCleanup(
+            new PipelineResult(PipelineOutcome.Cancelled),
+            dryRun: false));
     }
 
     [Fact]
